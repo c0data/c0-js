@@ -1,5 +1,5 @@
-// Runs the language-agnostic conformance vectors in ../conformance/
-// (vendored from c0-cr spec/conformance/, the source of truth).
+// Runs the shared conformance vectors from the c0-spec submodule
+// (https://github.com/trans/c0-spec), the source of truth.
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -18,7 +18,7 @@ const decoder = new TextDecoder()
 interface Case { name: string, [key: string]: unknown }
 
 function cases(file: string): Case[] {
-  const url = new URL(`../conformance/${file}`, import.meta.url)
+  const url = new URL(`../c0-spec/vectors/${file}`, import.meta.url)
   return JSON.parse(readFileSync(url, 'utf-8')).cases
 }
 
