@@ -1,5 +1,5 @@
 // Runs the shared conformance vectors from the c0-spec submodule
-// (https://github.com/trans/c0-spec), the source of truth.
+// (https://github.com/c0data/c0-spec), the source of truth.
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
