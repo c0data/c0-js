@@ -108,16 +108,20 @@ export class Builder {
     return this
   }
 
-  /** Write a simple reference to a named group. */
+  /**
+   * Write a reference: one segment is ENQ + group name, more is a path
+   * (ENQ STX segments-joined-by-US ETX). Reference targets are names, so
+   * control bytes are rejected.
+   */
   ref(...path: string[]): this {
     this.parts.push(ENQ)
     if (path.length === 1) {
-      this.pushStr(path[0])
+      this.pushName(path[0])
     } else {
       this.parts.push(STX)
       for (let i = 0; i < path.length; i++) {
         if (i > 0) this.parts.push(US)
-        this.pushStr(path[i])
+        this.pushName(path[i])
       }
       this.parts.push(ETX)
     }
@@ -188,10 +192,6 @@ export class Builder {
       }
     }
     return out
-  }
-
-  private pushStr(s: string): void {
-    this.parts.push(encoder.encode(s))
   }
 
   // Names (labels and headers) are identifiers, not values — control

@@ -715,3 +715,12 @@ describe('List fields', () => {
     assert.deepEqual(rec.list(1), [])
   })
 })
+
+describe('Reference name guard', () => {
+  it('rejects control bytes in reference names and path segments', () => {
+    assert.throws(() => new Builder().ref('bad\u001Fname'), /control bytes/)
+    assert.throws(() => new Builder().ref('users', '01\u001E', 'name'), /control bytes/)
+    const out = build(b => { b.ref('users'); b.ref('users', '01', 'name') })
+    assert.deepEqual(out, buf(ENQ, 'users', ENQ, STX, 'users', US, '01', US, 'name', ETX))
+  })
+})
