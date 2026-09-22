@@ -124,6 +124,22 @@ export class Builder {
     return this
   }
 
+  /**
+   * Write a field whose value is a flat list (spec: "arrays are US-separated
+   * values inside STX/ETX"): US, STX, the items separated by US, ETX.
+   * Read back with `Record#list`.
+   */
+  listField(items: string[]): this {
+    this.parts.push(US)
+    this.parts.push(STX)
+    for (let i = 0; i < items.length; i++) {
+      if (i > 0) this.parts.push(US)
+      this.pushEscaped(items[i])
+    }
+    this.parts.push(ETX)
+    return this
+  }
+
   /** Write a raw field value (for use within records when building fields individually). */
   field(value: string): this {
     this.parts.push(US)

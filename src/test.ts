@@ -654,3 +654,64 @@ describe('Diff', () => {
     assert.equal(result.get('test.txt'), 'function newName() {}')
   })
 })
+
+// ============================================================
+// List fields (Builder#listField / Record#list)
+// ============================================================
+
+describe('List fields', () => {
+  it('listField writes a US-separated list inside STX/ETX as one field', () => {
+    const out = build(b => {
+      b.group('users', null, () => {
+        b.record('Alice')
+        b.listField(['Admin', 'Editor', 'User'])
+        b.field('1502.30')
+      })
+    })
+    assert.deepEqual(out, buf(
+      GS, 'users',
+      RS, 'Alice',
+      US, STX, 'Admin', US, 'Editor', US, 'User', ETX,
+      US, '1502.30',
+    ))
+    const rec = new Table(out).record(0)
+    assert.equal(rec.fieldCount, 3)
+    assert.equal(dec.decode(rec.value(0)), 'Alice')
+    assert.deepEqual(rec.list(1).map(i => dec.decode(i)), ['Admin', 'Editor', 'User'])
+    assert.equal(dec.decode(rec.value(2)), '1502.30')
+  })
+
+  it('round-trips escaped items and empty lists through Record#list', () => {
+    const items = ['a\u001Fb', '', 'c\u0002d', 'plain']
+    const out = build(b => {
+      b.group('t', null, () => {
+        b.record('x')
+        b.listField(items)
+        b.listField([])
+      })
+    })
+    const rec = new Table(out).record(0)
+    assert.equal(rec.fieldCount, 3)
+    assert.deepEqual(rec.list(1).map(i => dec.decode(i)), items)
+    assert.deepEqual(rec.list(2), [])
+  })
+
+  it('Record#list unescapes items and keeps nested scopes intact', () => {
+    const b = buf(
+      GS, 't',
+      RS, STX, 'Ed', DLE, US, 'itor', US, STX, 'x', US, 'y', ETX, US, 'b', ETX,
+    )
+    const items = new Table(b).record(0).list(0)
+    assert.equal(items.length, 3)
+    assert.equal(dec.decode(items[0]), 'Ed\u001Fitor')
+    assert.equal(items[1][0], STX)
+    assert.equal(dec.decode(items[2]), 'b')
+  })
+
+  it('Record#list returns a plain field as a single item and an empty scope as empty', () => {
+    const b = buf(GS, 't', RS, 'plain', US, STX, ETX)
+    const rec = new Table(b).record(0)
+    assert.deepEqual(rec.list(0).map(i => dec.decode(i)), ['plain'])
+    assert.deepEqual(rec.list(1), [])
+  })
+})

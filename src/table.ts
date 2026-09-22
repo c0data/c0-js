@@ -90,6 +90,39 @@ export class Record {
     return result
   }
 
+  /**
+   * Field n as a flat list: the items of its STX/ETX scope split on
+   * top-level US, each DLE-unescaped (mirrors `value`). Inverse of
+   * `Builder#listField`. A field that is not an STX/ETX scope is returned
+   * as a single-item list holding its value; an empty scope is an empty list.
+   */
+  list(n: number): Uint8Array[] {
+    const raw = this.field(n)
+    if (!(raw.length > 0 && raw[0] === STX)) return [unescape(raw)]
+    let stop = raw.length
+    if (stop > 1 && raw[stop - 1] === ETX) stop--
+    const items: Uint8Array[] = []
+    if (stop <= 1) return items
+    let pos = 1
+    let itemStart = pos
+    while (pos < stop) {
+      const byte = raw[pos]
+      if (byte === US) {
+        items.push(unescape(raw.subarray(itemStart, pos)))
+        pos++
+        itemStart = pos
+      } else if (byte === DLE) {
+        pos += 2
+      } else if (byte === STX) {
+        pos = skipNested(raw, pos, stop)
+      } else {
+        pos++
+      }
+    }
+    items.push(unescape(raw.subarray(itemStart, stop)))
+    return items
+  }
+
   /** Raw bytes of the entire record. */
   get raw(): Uint8Array {
     return this.buf.subarray(this.start, this.end)
