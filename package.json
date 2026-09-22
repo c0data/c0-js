@@ -1,6 +1,6 @@
 {
   "name": "c0",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "C0DATA \u2014 structured data using ASCII C0 control codes",
   "type": "module",
   "main": "./dist/index.js",
