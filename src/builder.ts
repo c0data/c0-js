@@ -3,8 +3,16 @@ import { C0Error } from './error.js'
 
 const encoder = new TextEncoder()
 
+/** A value written byte-transparently: a string (encoded as UTF-8) or raw bytes. */
+export type BuilderValue = string | Uint8Array
+
 /**
  * Builds C0DATA documents in compact form.
+ *
+ * Names (file/group labels, headers, reference targets) are strings and
+ * reject control bytes. Values (record fields, list items, blocks, items,
+ * ETB payloads) are byte-transparent: pass a string for UTF-8 text or a
+ * Uint8Array for raw bytes; control bytes are DLE-escaped automatically.
  *
  * Example:
  *   const buf = build(b => {
@@ -56,7 +64,7 @@ export class Builder {
   }
 
   /** Write a record with positional fields. */
-  record(...fields: string[]): this {
+  record(...fields: BuilderValue[]): this {
     this.parts.push(RS)
     for (let i = 0; i < fields.length; i++) {
       if (i > 0) this.parts.push(US)
@@ -66,7 +74,7 @@ export class Builder {
   }
 
   /** Write a record from an array of fields. */
-  recordArray(fields: string[]): this {
+  recordArray(fields: BuilderValue[]): this {
     this.parts.push(RS)
     for (let i = 0; i < fields.length; i++) {
       if (i > 0) this.parts.push(US)
@@ -86,10 +94,10 @@ export class Builder {
    * integrity payload. The payload may not contain control bytes —
    * it is terminated by the next control code on read.
    */
-  etb(payload?: string): this {
+  etb(payload?: BuilderValue): this {
     this.parts.push(ETB)
     if (payload !== undefined) {
-      const bytes = encoder.encode(payload)
+      const bytes = toBytes(payload)
       for (let i = 0; i < bytes.length; i++) {
         if (bytes[i] < 0x20) {
           throw new C0Error('ETB payload may not contain control bytes')
@@ -133,7 +141,7 @@ export class Builder {
    * values inside STX/ETX"): US, STX, the items separated by US, ETX.
    * Read back with `Record#list`.
    */
-  listField(items: string[]): this {
+  listField(items: BuilderValue[]): this {
     this.parts.push(US)
     this.parts.push(STX)
     for (let i = 0; i < items.length; i++) {
@@ -145,7 +153,7 @@ export class Builder {
   }
 
   /** Write a raw field value (for use within records when building fields individually). */
-  field(value: string): this {
+  field(value: BuilderValue): this {
     this.parts.push(US)
     this.pushEscaped(value)
     return this
@@ -160,14 +168,14 @@ export class Builder {
   }
 
   /** Write a content block (RS + text) for document mode. */
-  block(text: string): this {
+  block(text: BuilderValue): this {
     this.parts.push(RS)
     this.pushEscaped(text)
     return this
   }
 
   /** Write a list item (US + text) for document mode. */
-  item(text: string): this {
+  item(text: BuilderValue): this {
     this.parts.push(US)
     this.pushEscaped(text)
     return this
@@ -206,8 +214,8 @@ export class Builder {
     this.parts.push(bytes)
   }
 
-  private pushEscaped(s: string): void {
-    const bytes = encoder.encode(s)
+  private pushEscaped(s: BuilderValue): void {
+    const bytes = toBytes(s)
     // Check if escaping is needed
     let needsEscape = false
     for (let i = 0; i < bytes.length; i++) {
@@ -227,6 +235,10 @@ export class Builder {
     }
     this.parts.push(new Uint8Array(escaped))
   }
+}
+
+function toBytes(v: BuilderValue): Uint8Array {
+  return typeof v === 'string' ? encoder.encode(v) : v
 }
 
 /** Build a C0DATA buffer using the builder API. */

@@ -2,7 +2,7 @@ export { SOH, STX, ETX, EOT, ENQ, DLE, ETB, SUB, FS, GS, RS, US, ASSIGNED } from
 export { C0Error, UnassignedCodeError, UnexpectedEndError } from './error.js'
 export { Token, TokenType, tokenSize, tokenValue } from './token.js'
 export { tokenize, tokenizeEach } from './tokenizer.js'
-export { Builder, build } from './builder.js'
+export { Builder, build, type BuilderValue } from './builder.js'
 export { Table, Record } from './table.js'
 export { unescape, canonical } from './canonical.js'
 export { StreamReader, StreamWriter, openLog, readLog, type StreamSink, type FileLog } from './stream.js'

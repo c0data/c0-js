@@ -165,3 +165,34 @@ describe('conformance: stream.json', () => {
     })
   }
 })
+
+describe('conformance: list.json', () => {
+  for (const c of cases('list.json')) {
+    it(c.name, () => {
+      const bytes = hexBytes(c.bytes as string)
+      const record = c.record as unknown[]
+
+      const rec = new Table(bytes).record(0)
+      assert.equal(rec.fieldCount, record.length)
+      record.forEach((f, i) => {
+        if (Array.isArray(f)) {
+          assert.deepEqual(rec.list(i), f.map(fieldBytes))
+        } else {
+          assert.deepEqual(rec.value(i), fieldBytes(f))
+        }
+      })
+
+      if (c.canonical as boolean) {
+        const buf = build(b => {
+          b.record(fieldBytes(record[0]))
+          for (const f of record.slice(1)) {
+            if (Array.isArray(f)) b.listField(f.map(fieldBytes))
+            else b.field(fieldBytes(f))
+          }
+        })
+        assert.equal(toHex(buf), c.bytes as string)
+        assert.equal(canonical(buf), true)
+      }
+    })
+  }
+})
