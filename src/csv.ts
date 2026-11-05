@@ -1,143 +1,108 @@
-import { DLE, FS } from './constants.js'
-import { build } from './builder.js'
-import { Table } from './table.js'
+/** CSV ⇄ C0DATA. */
+import { C0Error } from './error.js'
+import { isLevel, isReference, value as logicalValue } from './core.js'
+import { Group, Reference } from './body.js'
 import { Document } from './document.js'
+import { build } from './builder.js'
+import { utf8 } from './bytes.js'
 
-const decoder = new TextDecoder()
-
-/**
- * Convert CSV text to C0DATA compact bytes.
- *
- * The first row is treated as headers, remaining rows as records.
- */
+/** CSV text → one group with a header row and positional records. */
 export function fromCSV(input: string, groupName: string = 'data'): Uint8Array {
   const rows = parseCSV(input)
   if (rows.length === 0) return new Uint8Array(0)
-
   return build(b => {
-    const headers = rows[0]
-    b.group(groupName, headers, () => {
-      for (let i = 1; i < rows.length; i++) {
-        b.recordArray(rows[i])
-      }
-    })
+    b.group(groupName, rows[0])
+    for (let i = 1; i < rows.length; i++) b.record(...rows[i])
   })
 }
 
 /**
- * Convert C0DATA compact bytes to CSV text.
+ * A group → CSV text (header row first if present): the first group of
+ * the buffer, or the named one. A reference is written as its path
+ * (`tags/001`); a nested level has no CSV form and is an error.
  */
-export function toCSV(buf: Uint8Array): string {
-  const table = findTable(buf)
+export function toCSV(buf: Uint8Array, groupName?: string): string {
+  const g = findGroup(buf, groupName)
   const rows: string[][] = []
-
-  if (table.headerCount > 0) {
-    const headerRow: string[] = []
-    for (let i = 0; i < table.headerCount; i++) {
-      headerRow.push(decoder.decode(table.header(i)))
-    }
-    rows.push(headerRow)
-  }
-
-  table.eachRecord(rec => {
+  if (g.hasHeader) rows.push(g.headers.map(utf8))
+  for (const rec of g.records) {
     const row: string[] = []
-    for (let i = 0; i < rec.fieldCount; i++) {
-      row.push(unescape(rec.field(i)))
-    }
+    rec.fields.forEach((f, i) => {
+      if (isLevel(f)) throw new C0Error(`CSV cannot carry a nested level (group '${utf8(g.name)}', field ${i + 1})`)
+      if (isReference(f)) row.push(Reference.parse(f).segments.join('/'))
+      else row.push(utf8(logicalValue(f)))
+    })
     rows.push(row)
-  })
-
-  return rows.map(row =>
-    row.map(field => {
-      if (field.includes(',') || field.includes('"') || field.includes('\n')) {
-        return '"' + field.replace(/"/g, '""') + '"'
-      }
-      return field
-    }).join(',')
-  ).join('\n') + '\n'
+  }
+  return rows.map(row => row.map(quote).join(',')).join('\n') + '\n'
 }
 
-function findTable(buf: Uint8Array): Table {
-  if (buf.length > 0 && buf[0] === FS) {
-    const doc = new Document(buf)
-    if (doc.groupCount > 0) {
-      return doc.group(0).table
-    }
+function findGroup(buf: Uint8Array, name?: string): Group {
+  const body = new Document(buf).body
+  if (name !== undefined) {
+    const g = body.groups.find(x => utf8(x.name) === name)
+    if (!g) throw new C0Error(`no group named '${name}'`)
+    return g
   }
-  return new Table(buf)
+  const g = body.groups[0]
+  if (!g) throw new C0Error('no group in buffer')
+  return g
 }
 
-function unescape(field: Uint8Array): string {
-  let hasDLE = false
-  for (let i = 0; i < field.length; i++) {
-    if (field[i] === DLE) { hasDLE = true; break }
+function quote(field: string): string {
+  if (field.includes(',') || field.includes('"') || field.includes('\n') || field.includes('\r')) {
+    return '"' + field.replace(/"/g, '""') + '"'
   }
-  if (!hasDLE) return decoder.decode(field)
-
-  const out: number[] = []
-  let pos = 0
-  while (pos < field.length) {
-    if (field[pos] === DLE && pos + 1 < field.length) {
-      pos++
-      out.push(field[pos])
-    } else {
-      out.push(field[pos])
-    }
-    pos++
-  }
-  return decoder.decode(new Uint8Array(out))
+  return field
 }
 
-/** Simple CSV parser that handles quoted fields. */
-function parseCSV(input: string): string[][] {
+/** RFC 4180 CSV: comma-separated, double-quoted fields, LF or CRLF rows. */
+export function parseCSV(input: string): string[][] {
   const rows: string[][] = []
-  let pos = 0
-  const len = input.length
-
-  while (pos < len) {
-    const row: string[] = []
-    while (pos < len) {
-      if (input[pos] === '"') {
-        // Quoted field
-        pos++ // skip opening quote
-        let field = ''
-        while (pos < len) {
-          if (input[pos] === '"') {
-            if (pos + 1 < len && input[pos + 1] === '"') {
-              field += '"'
-              pos += 2
-            } else {
-              pos++ // skip closing quote
-              break
-            }
-          } else {
-            field += input[pos]
-            pos++
-          }
-        }
-        row.push(field)
-      } else {
-        // Unquoted field
-        let field = ''
-        while (pos < len && input[pos] !== ',' && input[pos] !== '\n' && input[pos] !== '\r') {
-          field += input[pos]
-          pos++
-        }
-        row.push(field)
-      }
-
-      if (pos < len && input[pos] === ',') {
-        pos++ // skip comma
-      } else {
-        break
-      }
-    }
-
-    // Skip line ending
-    if (pos < len && input[pos] === '\r') pos++
-    if (pos < len && input[pos] === '\n') pos++
-
-    if (row.length > 0) rows.push(row)
+  let row: string[] = []
+  let field = ''
+  let i = 0
+  let quoted = false
+  let fieldStarted = false
+  const endRow = (): void => {
+    row.push(field)
+    rows.push(row)
+    row = []
+    field = ''
+    fieldStarted = false
   }
+  while (i < input.length) {
+    const ch = input[i]
+    if (quoted) {
+      if (ch === '"') {
+        if (input[i + 1] === '"') { field += '"'; i += 2; continue }
+        quoted = false
+        i++
+        continue
+      }
+      field += ch
+      i++
+      continue
+    }
+    if (ch === '"') {
+      quoted = true
+      fieldStarted = true
+      i++
+    } else if (ch === ',') {
+      row.push(field)
+      field = ''
+      fieldStarted = false
+      i++
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && input[i + 1] === '\n') i++
+      i++
+      endRow()
+    } else {
+      field += ch
+      fieldStarted = true
+      i++
+    }
+  }
+  if (row.length > 0 || fieldStarted || field.length > 0) endRow()
   return rows
 }

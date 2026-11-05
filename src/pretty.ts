@@ -1,12 +1,14 @@
-import { SOH, STX, ETX, EOT, ENQ, DLE, ETB, SUB, FS, GS, RS, US } from './constants.js'
-
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
-
-/** Convert a C0 control byte to its Unicode Control Picture character. */
-export function glyph(byte: number): string {
-  return String.fromCodePoint(0x2400 + byte)
-}
+/**
+ * Pretty form: Unicode Control Pictures (U+2400 block) for the codes,
+ * line breaks and indentation as layout. `format` and `parse` are
+ * inverses on well-formed input.
+ */
+import {
+  SOH, STX, ETX, EOT, ENQ, BEL, DLE, SYN, ETB, CAN, EM, SUB, FS, GS, RS, US, HT, LF, CR, isLayout,
+} from './constants.js'
+import { C0Error, UnassignedCodeError } from './error.js'
+import { scanLayout, scanText, scanLevel, scanPlain, trim } from './core.js'
+import { ByteWriter, encoder, utf8 } from './bytes.js'
 
 export type FormatMode = 'compact' | 'aligned' | 'spaced'
 
@@ -15,502 +17,620 @@ export interface FormatOptions {
   mode?: FormatMode
 }
 
+export class GlyphInDataError extends C0Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GlyphInDataError'
+  }
+}
+
+/** Convert a C0 control byte to its Unicode Control Picture character. */
+export function glyph(byte: number): string {
+  return String.fromCodePoint(0x2400 + byte)
+}
+
+const GLYPH_BYTES: Uint8Array[] = []
+for (let b = 0; b < 0x20; b++) GLYPH_BYTES.push(encoder.encode(glyph(b)))
+
 /**
- * Format a compact C0DATA buffer as a human-readable Unicode string
- * with newlines and indentation.
+ * Format a compact buffer as pretty form.
  *
- * Modes:
- * - `'compact'` — no padding between fields (default)
- * - `'aligned'` — column-aligned fields within table groups
- * - `'spaced'`  — column-aligned + space after prefix glyphs and around ␟
+ * Modes: `'compact'` (one element per line, no padding; the default),
+ * `'aligned'` (column-aligned units within table groups), `'spaced'`
+ * (aligned, plus a space after the prefix and around ␟).
  */
 export function format(buf: Uint8Array, options?: string | FormatOptions): string {
   let indent = '  '
   let mode: FormatMode = 'compact'
-
   if (typeof options === 'string') {
     indent = options
   } else if (options) {
     indent = options.indent ?? '  '
     mode = options.mode ?? 'compact'
   }
-
-  const pretty = formatCompact(buf, indent)
-  if (mode === 'compact') return pretty
-  return align(pretty, mode)
+  const compact = new Formatter(buf, indent).run()
+  return mode === 'compact' ? compact : align(compact, mode)
 }
 
-function formatCompact(buf: Uint8Array, indent: string): string {
-  const parts: string[] = []
-  let pos = 0
-  const len = buf.length
-  let depth = 0
-  let lineStart = true
+// ---- formatting ----------------------------------------------------
 
-  while (pos < len) {
-    const byte = buf[pos]
+class Formatter {
+  private readonly buf: Uint8Array
+  private readonly len: number
+  private readonly indent: string
+  private readonly io = new ByteWriter()
+  private depth = 0      // nesting depth (levels)
+  private gdepth = 0     // group depth within the current level
+  private lineStart = true
+  private readonly stack: number[] = []
 
-    if (byte < 0x20) {
-      switch (byte) {
-        case FS:
-          depth = 0
-          if (!lineStart) parts.push('\n')
-          parts.push(glyph(byte))
+  constructor(buf: Uint8Array, indent: string) {
+    this.buf = buf
+    this.len = buf.length
+    this.indent = indent
+  }
+
+  run(): string {
+    const buf = this.buf
+    const len = this.len
+    const io = this.io
+    let pos = 0
+    while (pos < len) {
+      const byte = buf[pos]
+      if (byte >= 0x20 || isLayout(byte)) {
+        // stray plain or layout at element level: layout is dropped
+        if (isLayout(byte)) {
           pos++
-          depth = 1
-          pos = writeDataUntilControl(buf, pos, parts)
-          parts.push('\n')
-          lineStart = true
+        } else {
+          const start = pos
+          pos = scanPlain(buf, pos, len)
+          this.writeData(buf.subarray(start, pos))
+          this.lineStart = false
+        }
+        continue
+      }
+      switch (byte) {
+        case SYN:
+          this.newline()
+          this.g(SYN)
+          pos = this.writeHeading(pos + 1)
+          this.nl()
+          this.gdepth = 0
           break
-
+        case FS:
+          this.newline()
+          this.writeIndent(this.depth)
+          this.g(FS)
+          pos = this.writePlain(pos + 1)
+          this.nl()
+          this.gdepth = 1
+          break
         case GS: {
-          let gsRun = 0
-          while (pos < len && buf[pos] === GS) {
-            gsRun++
-            pos++
-          }
-          if (!lineStart) parts.push('\n')
-          writeIndent(parts, indent, depth)
-          for (let i = 0; i < gsRun; i++) parts.push(glyph(GS))
-          pos = writeDataUntilControl(buf, pos, parts)
-          parts.push('\n')
-          lineStart = true
+          let run = 0
+          while (pos < len && buf[pos] === GS) { run++; pos++ }
+          this.newline()
+          this.writeIndent(this.depth)
+          for (let i = 0; i < run; i++) this.g(GS)
+          pos = this.writePlain(pos)
+          this.nl()
+          this.gdepth = 1
           break
         }
-
-        case SOH:
-          writeIndent(parts, indent, depth + 1)
-          parts.push(glyph(byte))
-          pos++
-          pos = writeFieldsLine(buf, pos, parts)
-          parts.push('\n')
-          lineStart = true
+        case SOH: case RS: case BEL: case ETB:
+          this.newline()
+          this.writeIndent(this.depth + this.gdepth)
+          pos = this.writeElement(pos)
           break
-
-        case RS:
-          writeIndent(parts, indent, depth + 1)
-          parts.push(glyph(byte))
+        case CAN:
+          if (this.depth > 0) this.depth--
+          this.gdepth = this.stack.pop() ?? 0
+          this.newline()
+          this.writeIndent(this.depth + this.gdepth)
+          this.g(CAN)
           pos++
-          pos = writeFieldsLine(buf, pos, parts)
-          parts.push('\n')
-          lineStart = true
+          this.lineStart = false
+          // the rest of the enclosing record continues on this line
+          pos = this.writeUnits(pos)
+          if (!this.lineStart) this.nl()
           break
-
-        case STX:
-          parts.push(glyph(byte))
-          pos++
-          depth++
-          parts.push('\n')
-          lineStart = true
-          break
-
-        case ETX:
-          if (depth > 0) depth--
-          writeIndent(parts, indent, depth + 1)
-          parts.push(glyph(byte))
-          pos++
-          break
-
         case EOT:
-          if (!lineStart) parts.push('\n')
-          parts.push(glyph(byte))
-          parts.push('\n')
-          pos++
-          lineStart = true
-          break
-
-        case ENQ:
-          parts.push(glyph(byte))
+          this.newline()
+          this.g(EOT)
+          this.nl()
           pos++
           break
-
-        case DLE:
-          parts.push(glyph(byte))
-          pos++
-          if (pos < len) {
-            if (buf[pos] < 0x20) parts.push(glyph(buf[pos]))
-            else parts.push(String.fromCharCode(buf[pos]))
-            pos++
-          }
+        case EM: {
+          this.newline()
+          this.g(EM)
+          const tail = len - pos - 1
+          if (tail > 0) io.writeString(` ${tail} bytes`)
+          this.nl()
+          return this.finish()
+        }
+        case STX: case DLE: case ENQ: case US: case SUB:
+          // a unit-level code at element level (e.g. a diff pattern): write inline
+          pos = this.writeUnits(pos)
+          this.nl()
           break
-
-        case SUB:
-          parts.push(glyph(byte))
-          pos++
-          break
-
-        case US:
-          parts.push(glyph(byte))
-          pos++
-          break
-
-        case ETB:
-          // Commit marker not attached to a record line (e.g. after a
-          // group-name line). Indented on its own line with any payload.
-          if (lineStart) writeIndent(parts, indent, depth + 1)
-          parts.push(glyph(byte))
-          pos++
-          pos = writeDataUntilControl(buf, pos, parts)
-          parts.push('\n')
-          lineStart = true
-          break
-
         default:
-          parts.push(glyph(byte))
-          pos++
-          break
+          throw new UnassignedCodeError(byte, pos)
       }
-    } else {
-      // Data byte
-      parts.push(String.fromCharCode(byte))
-      pos++
-      lineStart = false
+    }
+    if (!this.lineStart) this.nl()
+    return this.finish()
+  }
+
+  private finish(): string {
+    return utf8(this.io.toUint8Array())
+  }
+
+  private g(code: number): void {
+    this.io.write(GLYPH_BYTES[code])
+  }
+
+  private nl(): void {
+    this.io.push(LF)
+    this.lineStart = true
+  }
+
+  private newline(): void {
+    if (!this.lineStart) this.io.push(LF)
+  }
+
+  // SOH / RS / BEL / ETB at element level: the element and its units on
+  // one line (a level opener breaks the line).
+  private writeElement(pos: number): number {
+    const buf = this.buf
+    const len = this.len
+    const byte = buf[pos]
+    this.lineStart = false
+    switch (byte) {
+      case BEL: {
+        this.g(BEL)
+        pos = scanLayout(buf, pos + 1, len)
+        if (pos < len && (buf[pos] >= 0x20 || buf[pos] === STX)) {
+          pos = this.writeUnits(pos)
+          this.nl()
+          return pos
+        }
+        // dead element: render it on this line
+        if (pos >= len) return pos
+        return this.writeElement(pos)
+      }
+      case SOH:
+        this.g(SOH)
+        pos = scanLayout(buf, pos + 1, len)
+        if (pos < len && buf[pos] === RS) {
+          this.g(RS)
+          pos++
+        }
+        pos = this.writeUnits(pos)
+        break
+      case RS:
+        this.g(RS)
+        pos = this.writeUnits(pos + 1)
+        break
+      case ETB:
+        this.g(ETB)
+        pos = this.writePlain(pos + 1)
+        break
+    }
+    if (!this.lineStart) this.nl()
+    return pos
+  }
+
+  // Units of a record/header/heading on the current line. Stops at a
+  // record-level code. A level opener writes ␐, breaks the line and
+  // increments the depth; the caller resumes at the matching CAN.
+  private writeUnits(pos: number): number {
+    const buf = this.buf
+    const len = this.len
+    while (pos < len) {
+      const b = buf[pos]
+      if (b >= 0x20) {
+        const start = pos
+        pos = scanPlain(buf, pos, len)
+        this.writeData(trim(buf.subarray(start, pos)))
+      } else if (isLayout(b)) {
+        pos++
+      } else if (b === US || b === ENQ || b === SUB) {
+        this.g(b)
+        pos++
+      } else if (b === SOH) {
+        const p2 = scanLayout(buf, pos + 1, len)
+        if (p2 < len && buf[p2] === RS) break
+        this.g(SOH)
+        pos++
+      } else if (b === STX) {
+        const stop = scanText(buf, pos, len)
+        this.writeText(buf.subarray(pos, stop))
+        pos = stop
+      } else if (b === DLE) {
+        this.g(DLE)
+        this.io.push(LF)
+        this.stack.push(this.gdepth)
+        this.depth++
+        this.lineStart = true
+        return pos + 1
+      } else if (b === BEL) {
+        const p2 = scanLayout(buf, pos + 1, len)
+        if (p2 < len && (buf[p2] >= 0x20 || buf[p2] === STX || buf[p2] === DLE)) {
+          this.g(BEL)
+          pos = p2
+        } else {
+          break
+        }
+      } else if (b === ETB) {
+        this.g(ETB)
+        pos = this.writePlain(pos + 1)
+      } else {
+        break
+      }
+    }
+    this.lineStart = false
+    return pos
+  }
+
+  private writeHeading(pos: number): number {
+    const buf = this.buf
+    const len = this.len
+    while (pos < len) {
+      const b = buf[pos]
+      if (b === SOH) {
+        const p2 = scanLayout(buf, pos + 1, len)
+        if (p2 < len && buf[p2] === RS) break
+        this.g(SOH)
+        pos = this.writePlain(p2)
+        if (pos < len && buf[pos] === US) {
+          this.g(US)
+          pos = scanLayout(buf, pos + 1, len)
+          if (pos < len && buf[pos] === STX) {
+            const stop = scanText(buf, pos, len)
+            this.writeText(buf.subarray(pos, stop))
+            pos = stop
+          } else if (pos < len && buf[pos] === DLE) {
+            const stop = scanLevel(buf, pos, len)
+            // a nested heading value is written inline
+            this.writeInlineLevel(buf.subarray(pos, stop))
+            pos = stop
+          } else {
+            pos = this.writePlain(pos)
+          }
+        }
+      } else if (b === BEL) {
+        const p2 = scanLayout(buf, pos + 1, len)
+        if (p2 < len && (buf[p2] >= 0x20 || buf[p2] === STX)) {
+          this.g(BEL)
+          pos = p2
+          if (buf[pos] === STX) {
+            const stop = scanText(buf, pos, len)
+            this.writeText(buf.subarray(pos, stop))
+            pos = stop
+          } else {
+            pos = this.writePlain(pos)
+          }
+        } else if (p2 < len && buf[p2] === SOH) {
+          this.g(BEL)
+          pos = p2
+        } else {
+          break
+        }
+      } else if (isLayout(b)) {
+        pos++
+      } else {
+        break
+      }
+    }
+    return pos
+  }
+
+  // A level written on one line (used for heading values).
+  private writeInlineLevel(raw: Uint8Array): void {
+    let i = 0
+    while (i < raw.length) {
+      const b = raw[i]
+      if (b === STX) {
+        const stop = scanText(raw, i)
+        this.writeText(raw.subarray(i, stop))
+        i = stop
+      } else if (b >= 0x20) {
+        const start = i
+        i = scanPlain(raw, i)
+        this.writeData(trim(raw.subarray(start, i)))
+      } else if (isLayout(b)) {
+        i++
+      } else {
+        this.g(b)
+        i++
+      }
     }
   }
-  if (!lineStart) parts.push('\n')
-  return parts.join('')
+
+  private writePlain(pos: number): number {
+    const buf = this.buf
+    pos = scanLayout(buf, pos, this.len)
+    const start = pos
+    pos = scanPlain(buf, pos, this.len)
+    this.writeData(trim(buf.subarray(start, pos)))
+    return pos
+  }
+
+  // A whole text (STX … ETX): glyphs for the brackets and for any control
+  // byte inside; everything else as is.
+  private writeText(text: Uint8Array): void {
+    checkGlyphs(text)
+    this.g(STX)
+    const stop = text.length - 1
+    for (let i = 1; i < stop; i++) {
+      const b = text[i]
+      if (b < 0x20 && b !== LF && b !== CR && b !== HT) this.g(b)
+      else this.io.push(b)
+    }
+    this.g(ETX)
+  }
+
+  private writeData(data: Uint8Array): void {
+    checkGlyphs(data)
+    this.io.write(data)
+  }
+
+  private writeIndent(depth: number): void {
+    for (let i = 0; i < depth; i++) this.io.writeString(this.indent)
+  }
+}
+
+// Pretty form cannot show a value that contains a Control Picture
+// character (U+2400–U+241F, UTF-8 E2 90 80–9F).
+function checkGlyphs(data: Uint8Array): void {
+  for (let i = 0; i + 2 < data.length; i++) {
+    if (data[i] === 0xE2 && data[i + 1] === 0x90 && data[i + 2] >= 0x80 && data[i + 2] <= 0x9F) {
+      throw new GlyphInDataError('value contains a Control Picture character and cannot be shown in pretty form')
+    }
+  }
+}
+
+// ---- parsing ---------------------------------------------------------
+
+function glyphCode(ch: string): number {
+  const cp = ch.codePointAt(0)!
+  return cp >= 0x2400 && cp <= 0x241F ? cp - 0x2400 : -1
 }
 
 /**
- * Parse pretty-form back to compact form.
- *
- * Rules:
- * - Unicode Control Pictures (U+2400-U+241F) → C0 bytes
- * - LF/CR are ignored (formatting only)
- * - Whitespace adjacent to control codes is trimmed
- * - Inside STX/ETX, everything is preserved verbatim
+ * Pretty form → compact bytes. Glyphs become codes; outside text, layout
+ * touching a code is dropped and interior spaces are kept; inside text
+ * everything is kept.
  */
 export function parse(str: string): Uint8Array {
-  const out: number[] = []
-  const wsBuf: number[] = []
-  let trimAfter = true
+  const io = new ByteWriter()
+  const chars = Array.from(str)
   let i = 0
-
-  while (i < str.length) {
-    const cp = str.codePointAt(i)!
-    const charLen = cp > 0xffff ? 2 : 1
-
-    if (cp >= 0x2400 && cp <= 0x241f) {
-      const code = cp - 0x2400
-      // Discard buffered whitespace
-      wsBuf.length = 0
-
+  let pending = '' // whitespace between data characters
+  let afterCode = true
+  while (i < chars.length) {
+    const ch = chars[i]
+    const code = glyphCode(ch)
+    if (code >= 0) {
+      pending = ''
+      io.push(code)
+      i++
       if (code === STX) {
-        out.push(code)
-        i += charLen
-        // Inside STX/ETX: preserve everything verbatim
-        i = parseQuoted(str, i, out)
-      } else {
-        out.push(code)
-        i += charLen
+        i = parseText(chars, i, io)
+      } else if (code === EM) {
+        // the rest of the line is a summary, not data
+        while (i < chars.length && chars[i] !== '\n') i++
       }
-      trimAfter = true
-    } else if (cp === 0x0a || cp === 0x0d) {
-      // LF/CR ignored, discard buffered whitespace
-      wsBuf.length = 0
-      trimAfter = true
-      i += charLen
-    } else if (cp === 0x20 || cp === 0x09) {
-      if (trimAfter) {
-        i += charLen
-        continue
-      }
-      // Buffer whitespace
-      wsBuf.push(cp)
-      i += charLen
+      afterCode = true
+    } else if (ch === '\n' || ch === '\r') {
+      pending = ''
+      afterCode = true
+      i++
+    } else if (ch === ' ' || ch === '\t') {
+      if (!afterCode) pending += ch
+      i++
     } else {
-      trimAfter = false
-      // Flush buffered whitespace
-      if (wsBuf.length > 0) {
-        for (const ws of wsBuf) out.push(ws)
-        wsBuf.length = 0
+      if (pending.length > 0) {
+        io.writeString(pending)
+        pending = ''
       }
-      // Write UTF-8 bytes
-      const bytes = encoder.encode(String.fromCodePoint(cp))
-      for (const b of bytes) out.push(b)
-      i += charLen
+      afterCode = false
+      io.writeString(ch)
+      i++
     }
   }
-
-  return new Uint8Array(out)
+  return io.toUint8Array()
 }
 
-function parseQuoted(str: string, i: number, out: number[]): number {
-  let depth = 1
-
-  while (i < str.length) {
-    const cp = str.codePointAt(i)!
-    const charLen = cp > 0xffff ? 2 : 1
-
-    if (cp >= 0x2400 && cp <= 0x241f) {
-      const code = cp - 0x2400
-      out.push(code)
-      if (code === STX) depth++
-      else if (code === ETX) {
-        depth--
-        if (depth === 0) { i += charLen; break }
+// Inside text: everything verbatim until the ETX glyph; a DLE glyph takes
+// the next glyph with it.
+function parseText(chars: string[], i: number, io: ByteWriter): number {
+  while (i < chars.length) {
+    const code = glyphCode(chars[i])
+    if (code >= 0) {
+      io.push(code)
+      i++
+      if (code === DLE && i < chars.length) {
+        const nx = glyphCode(chars[i])
+        if (nx >= 0) {
+          io.push(nx)
+          i++
+        }
+      } else if (code === ETX) {
+        return i
       }
-      i += charLen
     } else {
-      const bytes = encoder.encode(String.fromCodePoint(cp))
-      for (const b of bytes) out.push(b)
-      i += charLen
+      io.writeString(chars[i])
+      i++
     }
   }
   return i
 }
 
-function writeDataUntilControl(buf: Uint8Array, pos: number, parts: string[]): number {
-  while (pos < buf.length && buf[pos] >= 0x20) {
-    parts.push(String.fromCharCode(buf[pos]))
-    pos++
-  }
-  return pos
-}
+// ---- alignment -------------------------------------------------------
 
-function writeFieldsLine(buf: Uint8Array, pos: number, parts: string[]): number {
-  const len = buf.length
-  while (pos < len) {
-    const byte = buf[pos]
-    if (byte === US) {
-      parts.push(glyph(US))
-      pos++
-    } else if (byte === DLE) {
-      parts.push(glyph(DLE))
-      pos++
-      if (pos < len) {
-        if (buf[pos] < 0x20) parts.push(glyph(buf[pos]))
-        else parts.push(String.fromCharCode(buf[pos]))
-        pos++
-      }
-    } else if (byte === ENQ) {
-      parts.push(glyph(ENQ))
-      pos++
-    } else if (byte === ETB) {
-      // Commit marker stays on the record's line, with any payload
-      parts.push(glyph(ETB))
-      pos++
-      while (pos < len && buf[pos] >= 0x20) {
-        parts.push(String.fromCharCode(buf[pos]))
-        pos++
-      }
-    } else if (byte === STX) {
-      parts.push(glyph(STX))
-      pos++
-      while (pos < len) {
-        const b = buf[pos]
-        if (b === ETX) {
-          parts.push(glyph(ETX))
-          pos++
-          break
-        } else if (b === US) {
-          parts.push(glyph(US))
-          pos++
-        } else if (b < 0x20) {
-          parts.push(glyph(b))
-          pos++
-        } else {
-          parts.push(String.fromCharCode(b))
-          pos++
-        }
-      }
-    } else if (byte < 0x20) {
-      break
-    } else {
-      parts.push(String.fromCharCode(byte))
-      pos++
-    }
-  }
-  return pos
-}
-
-function writeIndent(parts: string[], indent: string, depth: number): void {
-  for (let i = 0; i < depth; i++) parts.push(indent)
-}
-
-// --- Column alignment ---
-
-const G_FS  = glyph(FS)
-const G_GS  = glyph(GS)
-const G_RS  = glyph(RS)
+const G_FS = glyph(FS)
+const G_GS = glyph(GS)
+const G_RS = glyph(RS)
 const G_SOH = glyph(SOH)
-const G_US  = glyph(US)
+const G_US = glyph(US)
 const G_EOT = glyph(EOT)
+const G_STX = glyph(STX)
+const G_ETX = glyph(ETX)
 const G_DLE = glyph(DLE)
+const G_CAN = glyph(CAN)
+const G_SYN = glyph(SYN)
+const G_BEL = glyph(BEL)
 
-const PREFIXES = new Set([G_FS, G_GS, G_RS, G_SOH, G_US])
+const PREFIXES = new Set([G_FS, G_GS, G_RS, G_SOH, G_US, G_SYN, G_BEL])
 
 interface TableLine {
   lineIndex: number
-  prefix: string   // indent + prefix glyph(s)
+  prefix: string
   fields: string[]
+  /** seps[i] is what stood between fields[i] and fields[i+1]: G_US, or '' when the next field begins with its own SOH mark. */
+  seps: string[]
 }
 
-interface TableGroup {
-  lines: TableLine[]
+function width(s: string): number {
+  return Array.from(s).length
 }
 
 /**
- * Reformat a pretty-form string with column alignment.
- *
- * Modes:
- * - `'aligned'` — column alignment only
- * - `'spaced'`  — column alignment + space after prefix + space around ␟
+ * Reformat a pretty-form string with column alignment. Keyed records
+ * (SOH units) are aligned on their US like two-column tables.
  */
 export function align(pretty: string, mode: FormatMode = 'spaced'): string {
   const lines = pretty.split('\n')
-  // Remove trailing empty line from split (format always ends with \n)
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
-
   const groups = findTableGroups(lines)
   const spaced = mode === 'spaced'
   const sp = spaced ? ' ' : ''
 
-  // Build set of line indices handled by table groups
   const tableLineIndices = new Set<number>()
-  for (const group of groups) {
-    for (const line of group.lines) {
-      tableLineIndices.add(line.lineIndex)
-    }
-  }
+  for (const g of groups) for (const l of g) tableLineIndices.add(l.lineIndex)
 
-  // Format table groups with column alignment
   for (const group of groups) {
-    if (group.lines.length < 1) continue
-
-    const colCount = group.lines[0].fields.length
+    if (group.length === 0) continue
+    const colCount = Math.max(...group.map(l => l.fields.length))
     const maxWidths = new Array<number>(colCount).fill(0)
-    for (const line of group.lines) {
-      for (let col = 0; col < line.fields.length; col++) {
-        maxWidths[col] = Math.max(maxWidths[col], line.fields[col].length)
-      }
+    for (const line of group) {
+      line.fields.forEach((f, c) => { maxWidths[c] = Math.max(maxWidths[c], width(f)) })
     }
-
-    for (const line of group.lines) {
+    for (const line of group) {
       let text = line.prefix + sp
-      for (let col = 0; col < line.fields.length; col++) {
-        const field = line.fields[col]
+      line.fields.forEach((field, col) => {
         if (col < line.fields.length - 1) {
-          text += field.padEnd(maxWidths[col]) + sp + G_US + sp
+          text += field + ' '.repeat(maxWidths[col] - width(field))
+          text += line.seps[col] === G_US ? sp + G_US + sp : ' '
         } else {
           text += field
         }
-      }
+      })
       lines[line.lineIndex] = text
     }
   }
 
-  // Format non-table lines: add/remove space after prefix glyphs
-  for (let i = 0; i < lines.length; i++) {
-    if (tableLineIndices.has(i)) continue
-    const text = lines[i]
-    if (text.trim() === '') continue
-
-    // Find indent
+  lines.forEach((text, i) => {
+    if (tableLineIndices.has(i)) return
+    if (text.trim() === '') return
+    const chars = Array.from(text)
     let wsEnd = 0
-    while (wsEnd < text.length && (text[wsEnd] === ' ' || text[wsEnd] === '\t')) wsEnd++
-    const indent = text.slice(0, wsEnd)
-
-    // Find prefix glyphs
+    while (wsEnd < chars.length && (chars[wsEnd] === ' ' || chars[wsEnd] === '\t')) wsEnd++
     let glyphEnd = wsEnd
-    while (glyphEnd < text.length && PREFIXES.has(text[glyphEnd])) glyphEnd++
-    // Include SOH after prefix glyphs (e.g. ␝name␁)
-    if (glyphEnd > wsEnd && glyphEnd < text.length && text[glyphEnd] === G_SOH) glyphEnd++
-
-    if (glyphEnd === wsEnd) continue  // no prefix glyphs
-    if (glyphEnd >= text.length) continue  // no content after prefix
-
-    const glyphs = text.slice(wsEnd, glyphEnd)
-    const rest = text.slice(glyphEnd)
-
-    if (spaced) {
-      lines[i] = indent + glyphs + ' ' + rest.trimStart()
-    } else {
-      lines[i] = indent + glyphs + rest.trimStart()
-    }
-  }
+    while (glyphEnd < chars.length && PREFIXES.has(chars[glyphEnd])) glyphEnd++
+    if (glyphEnd === wsEnd) return
+    if (glyphEnd >= chars.length) return
+    const indentStr = chars.slice(0, wsEnd).join('')
+    const glyphs = chars.slice(wsEnd, glyphEnd).join('')
+    const rest = chars.slice(glyphEnd).join('').replace(/^\s+/, '')
+    lines[i] = spaced ? `${indentStr}${glyphs} ${rest}` : `${indentStr}${glyphs}${rest}`
+  })
 
   return lines.join('\n') + '\n'
 }
 
-function findTableGroups(lines: string[]): TableGroup[] {
-  const groups: TableGroup[] = []
-  let current: TableGroup | null = null
-  let expectedCols = -1
-
-  for (let i = 0; i < lines.length; i++) {
-    const text = lines[i]
+function findTableGroups(lines: string[]): TableLine[][] {
+  const groups: TableLine[][] = []
+  let current: TableLine[] | null = null
+  const flush = (): void => {
+    if (current && current.length > 0) groups.push(current)
+    current = null
+  }
+  lines.forEach((text, i) => {
     const trimmed = text.trim()
-
-    // Group boundaries: empty, FS, GS, EOT
-    if (trimmed === '' || trimmed.startsWith(G_GS) || trimmed.startsWith(G_FS) || trimmed.startsWith(G_EOT)) {
-      if (current && current.lines.length > 0) groups.push(current)
-      current = null
-      expectedCols = -1
-      continue
+    if (trimmed === '' || trimmed.startsWith(G_GS) || trimmed.startsWith(G_FS) || trimmed.startsWith(G_EOT) ||
+        trimmed.startsWith(G_SYN) || trimmed.startsWith(G_CAN)) {
+      flush()
+      return
     }
-
     if (trimmed.startsWith(G_SOH) || trimmed.startsWith(G_RS)) {
       const parsed = parseTableLine(i, text)
-      if (!parsed || parsed.fields.length < 2) {
-        if (current && current.lines.length > 0) groups.push(current)
-        current = null
-        expectedCols = -1
-        continue
+      if (parsed === null || parsed.fields.length < 2) {
+        flush()
+        return
       }
-
-      const colCount = parsed.fields.length
-      if (current === null || (expectedCols !== -1 && colCount !== expectedCols)) {
-        if (current && current.lines.length > 0) groups.push(current)
-        current = { lines: [] }
-        expectedCols = colCount
-      }
-
-      current.lines.push(parsed)
+      if (current === null) current = []
+      current.push(parsed)
     } else {
-      if (current && current.lines.length > 0) groups.push(current)
-      current = null
-      expectedCols = -1
+      flush()
     }
-  }
-
-  if (current && current.lines.length > 0) groups.push(current)
+  })
+  flush()
   return groups
 }
 
+// Split a ␞ or ␁␞ line into its units on ␟ (text is not split; a keyed
+// record splits on its ␁ marks too, so key and value align).
 function parseTableLine(lineIndex: number, text: string): TableLine | null {
-  // Find the prefix glyph (SOH or RS)
-  let markerPos = -1
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === ' ' || text[i] === '\t') continue
-    if (text[i] === G_SOH || text[i] === G_RS) {
-      markerPos = i
-      break
-    }
+  const chars = Array.from(text)
+  let i = 0
+  while (i < chars.length && (chars[i] === ' ' || chars[i] === '\t')) i++
+  if (i >= chars.length) return null
+  if (chars[i] === G_SOH) {
+    i++
+    if (!(i < chars.length && chars[i] === G_RS)) return null
+    i++
+  } else if (chars[i] === G_RS) {
+    i++
+  } else {
     return null
   }
-  if (markerPos === -1) return null
-
-  const prefix = text.slice(0, markerPos + 1)
-  const rest = text.slice(markerPos + 1)
-
-  // Split on US glyph, respecting DLE escapes
+  const prefix = chars.slice(0, i).join('')
+  const prefixLen = i
   const fields: string[] = []
+  const seps: string[] = []
   let field = ''
-  for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === G_DLE && i + 1 < rest.length) {
-      field += rest[i] + rest[i + 1]
-      i++
-    } else if (rest[i] === G_US) {
+  let inText = false
+  const keyed = i < chars.length && chars[i] === G_SOH
+  while (i < chars.length) {
+    const ch = chars[i]
+    if (inText) {
+      field += ch
+      if (ch === G_ETX) inText = false
+      if (ch === G_DLE && i + 1 < chars.length) {
+        field += chars[i + 1]
+        i++
+      }
+    } else if (ch === G_STX) {
+      inText = true
+      field += ch
+    } else if (ch === G_DLE || ch === G_CAN) {
+      return null // nested levels are not aligned
+    } else if (ch === G_US) {
       fields.push(field.trim())
+      seps.push(G_US)
       field = ''
+    } else if (keyed && ch === G_SOH && i > prefixLen) {
+      fields.push(field.trim())
+      seps.push('')
+      field = ch
     } else {
-      field += rest[i]
+      field += ch
     }
+    i++
   }
+  if (inText) return null // text continues on the next line
   fields.push(field.trim())
-
   if (fields.length < 2) return null
-
-  return { lineIndex, prefix, fields }
+  return { lineIndex, prefix, fields, seps }
 }

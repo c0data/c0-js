@@ -1,394 +1,236 @@
-import { SOH, STX, ETX, EOT, DLE, FS, GS, RS, US } from './constants.js'
-import { Table } from './table.js'
+/**
+ * JSON ⇄ C0DATA. Export never guesses: a positional record is an array, a
+ * keyed record an object, a group with a header row an array of objects,
+ * a reference `{"$ref": "group/record/field"}`.
+ */
+import { isLevel, isReference, value as logicalValue } from './core.js'
+import { Body, Group, Record, Reference, levelOf } from './body.js'
 import { Document } from './document.js'
+import { Builder, build } from './builder.js'
+import { utf8 } from './bytes.js'
 
-const decoder = new TextDecoder()
-
-/** Recursive value type for intermediate data structures. */
 export type Value = string | Value[] | { [key: string]: Value }
 
-// --- Export: C0DATA → JSON/YAML ---
+// --- Export: C0DATA → JSON ---
 
-/** Convert C0DATA compact bytes to a JSON string. */
 export function toJSON(buf: Uint8Array): string {
-  return JSON.stringify(exportValue(buf), null, 2)
+  return JSON.stringify(toObject(buf), null, 2)
 }
 
-/** Convert C0DATA compact bytes to a JS value. */
 export function toObject(buf: Uint8Array): Value {
-  return exportValue(buf)
+  return exportBody(new Document(buf).body)
 }
 
-/** Convert JSON string to C0DATA compact bytes. */
+/** A body: {file: groups} per named file, or the groups directly; a bare body exports as its group. */
+export function exportBody(body: Body, level: boolean = false): Value {
+  const files = body.files
+  if (files.length === 1) {
+    const f = files[0]
+    if (f.name.length === 0) return exportGroups(f.groups, level)
+    return { [utf8(f.name)]: exportGroups(f.groups, level) }
+  }
+  const out: { [key: string]: Value } = {}
+  for (const f of files) out[utf8(f.name)] = exportGroups(f.groups, level)
+  return out
+}
+
+function exportGroups(groups: Group[], level: boolean = false): Value {
+  if (groups.length === 0) return []
+  if (groups.length === 1 && groups[0].name.length === 0 && groups[0].depth === 0) return exportGroup(groups[0], level)
+  const out: { [key: string]: Value } = {}
+  for (const g of groups) out[utf8(g.name)] = exportGroup(g)
+  return out
+}
+
+/** A group: with a header row, an array of objects; a single keyed record is an object; otherwise an array of records. */
+export function exportGroup(g: Group, level: boolean = false): Value {
+  if (g.hasHeader) {
+    const headers = g.headers.map(utf8)
+    const rows: Value[] = []
+    for (const rec of g.records) {
+      if (rec.keyed) {
+        rows.push(exportRecord(rec))
+      } else {
+        const row: { [key: string]: Value } = {}
+        const n = rec.fieldCount
+        headers.forEach((h, i) => { row[h] = i < n ? exportRaw(rec.field(i)) : '' })
+        rows.push(row)
+      }
+    }
+    return rows
+  }
+  const recs = g.records
+  if (recs.length === 1 && (recs[0].keyed || level)) return exportRecord(recs[0])
+  return recs.map(exportRecord)
+}
+
+export function exportRecord(rec: Record): Value {
+  if (rec.keyed) {
+    const obj: { [key: string]: Value } = {}
+    for (const [k] of rec.pairs) {
+      const key = utf8(k)
+      obj[key] = exportRaw(rec.keyField(key)!)
+    }
+    return obj
+  }
+  const arr: Value[] = []
+  for (let i = 0; i < rec.fieldCount; i++) arr.push(exportRaw(rec.field(i)))
+  return arr
+}
+
+function exportRaw(raw: Uint8Array): Value {
+  if (isLevel(raw)) return exportBody(levelOf(raw), true)
+  if (isReference(raw)) return { $ref: Reference.parse(raw).segments.join('/') }
+  return utf8(logicalValue(raw))
+}
+
+// --- Import: JSON → C0DATA ---
+
 export function fromJSON(input: string, groupName: string = 'data'): Uint8Array {
-  const value = JSON.parse(input)
-  const out: number[] = []
-  emitRoot(jsonToValue(value), groupName, out)
-  return new Uint8Array(out)
+  return fromObject(JSON.parse(input), groupName)
 }
 
-/** Convert a JS value to C0DATA compact bytes. */
+/** Any JSON-like value: objects, arrays, strings; numbers and booleans are stringified, null is empty. */
 export function fromObject(value: unknown, groupName: string = 'data'): Uint8Array {
-  const out: number[] = []
-  emitRoot(jsonToValue(value), groupName, out)
-  return new Uint8Array(out)
+  return emitRoot(normalize(value), groupName)
 }
 
-// --- Internal export ---
-
-function exportValue(buf: Uint8Array): Value {
-  if (buf.length > 0 && buf[0] === FS) {
-    const doc = new Document(buf)
-    return exportDocument(doc)
-  } else if (buf.length > 0 && buf[0] === GS) {
-    const table = new Table(buf)
-    const name = decoder.decode(table.name)
-    return { [name]: exportGroupData(table) }
+function normalize(v: unknown): Value {
+  if (v === null || v === undefined) return ''
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) return v.map(normalize)
+  if (typeof v === 'object') {
+    const out: { [key: string]: Value } = {}
+    for (const [k, x] of Object.entries(v as object)) out[k] = normalize(x)
+    return out
   }
-  return {}
+  return String(v)
 }
 
-function exportDocument(doc: Document): Value {
-  const name = decoder.decode(doc.name)
-  const groups: { [key: string]: Value } = {}
-  doc.eachGroup(group => {
-    groups[decoder.decode(group.name)] = exportGroupData(group.table)
-  })
-
-  if (name === '') return groups
-  return { [name]: groups }
+function isObject(v: Value): v is { [key: string]: Value } {
+  return typeof v === 'object' && !Array.isArray(v)
 }
 
-function exportGroupData(table: Table): Value {
-  if (table.headerCount > 0) {
-    return exportTable(table)
-  } else if (table.recordCount > 0 && table.record(0).fieldCount === 2) {
-    return exportKV(table)
-  } else if (table.recordCount > 0) {
-    return exportRecords(table)
-  }
-  return []
-}
-
-function exportTable(table: Table): Value {
-  const headers: string[] = []
-  for (let i = 0; i < table.headerCount; i++) {
-    headers.push(decoder.decode(table.header(i)))
-  }
-
-  const rows: Value[] = []
-  table.eachRecord(rec => {
-    const row: { [key: string]: Value } = {}
-    for (let i = 0; i < headers.length; i++) {
-      row[headers[i]] = fieldToValue(rec.field(i))
-    }
-    rows.push(row)
-  })
-  return rows
-}
-
-function exportKV(table: Table): Value {
-  const obj: { [key: string]: Value } = {}
-  table.eachRecord(rec => {
-    obj[unescape(rec.field(0))] = fieldToValue(rec.field(1))
-  })
-  return obj
-}
-
-function exportRecords(table: Table): Value {
-  const rows: Value[] = []
-  table.eachRecord(rec => {
-    const fields: Value[] = []
-    for (let i = 0; i < rec.fieldCount; i++) {
-      fields.push(fieldToValue(rec.field(i)))
-    }
-    rows.push(fields)
-  })
-  return rows
-}
-
-function fieldToValue(field: Uint8Array): Value {
-  if (field.length > 0 && field[0] === STX) {
-    return parseNestedField(field)
-  }
-  return unescape(field)
-}
-
-function parseNestedField(field: Uint8Array): Value {
-  let stop = field.length
-  if (stop > 0 && field[stop - 1] === ETX) stop--
-  let pos = 1 // skip STX
-
-  // Detect structure: scan for RS at top level
-  let hasRS = false
-  let scan = pos
-  while (scan < stop) {
-    const byte = field[scan]
-    if (byte === RS) { hasRS = true; break }
-    if (byte === STX) { scan = skipNestedBytes(field, scan, stop) }
-    else if (byte === DLE) { scan += 2 }
-    else { scan++ }
-  }
-
-  return hasRS
-    ? parseNestedKV(field, pos, stop)
-    : parseNestedArray(field, pos, stop)
-}
-
-function parseNestedKV(field: Uint8Array, pos: number, stop: number): Value {
-  const obj: { [key: string]: Value } = {}
-  while (pos < stop) {
-    if (field[pos] === RS) {
-      pos++
-      const keyStart = pos
-      while (pos < stop && field[pos] !== US) {
-        if (field[pos] === DLE) pos += 2
-        else pos++
-      }
-      const key = unescape(field.subarray(keyStart, pos))
-      if (pos < stop && field[pos] === US) {
-        pos++
-        const valStart = pos
-        while (pos < stop && field[pos] !== RS) {
-          if (field[pos] === STX) pos = skipNestedBytes(field, pos, stop)
-          else if (field[pos] === DLE) pos += 2
-          else pos++
-        }
-        obj[key] = fieldToValue(field.subarray(valStart, pos))
+// Top-level layout: an object of groups (one key wrapping an object of
+// groups becomes a file); an array becomes one group; an object of
+// scalars becomes one group holding one map; a scalar one record.
+function emitRoot(value: Value, groupName: string): Uint8Array {
+  return build(b => {
+    if (isObject(value)) {
+      const entries = Object.entries(value)
+      const inner = entries.length === 1 ? entries[0][1] : undefined
+      if (inner !== undefined && isObject(inner) && allGroupable(inner)) {
+        b.file(entries[0][0])
+        emitGroups(b, inner)
+      } else if (allGroupable(value)) {
+        emitGroups(b, value)
       } else {
-        obj[key] = ''
+        b.group(groupName)
+        emitMap(b, value)
       }
-    } else {
-      pos++
-    }
-  }
-  return obj
-}
-
-function parseNestedArray(field: Uint8Array, pos: number, stop: number): Value {
-  const items: Value[] = []
-  while (pos < stop) {
-    if (field[pos] === US) {
-      pos++
-      const itemStart = pos
-      while (pos < stop && field[pos] !== US) {
-        if (field[pos] === STX) pos = skipNestedBytes(field, pos, stop)
-        else if (field[pos] === DLE) pos += 2
-        else pos++
-      }
-      items.push(fieldToValue(field.subarray(itemStart, pos)))
-    } else {
-      pos++
-    }
-  }
-  return items
-}
-
-function skipNestedBytes(buf: Uint8Array, pos: number, stop: number): number {
-  pos++ // skip STX
-  let depth = 1
-  while (pos < stop && depth > 0) {
-    if (buf[pos] === STX) depth++
-    else if (buf[pos] === ETX) depth--
-    else if (buf[pos] === DLE) pos++
-    pos++
-  }
-  return pos
-}
-
-// --- Internal import ---
-
-function jsonToValue(any: unknown): Value {
-  if (any === null || any === undefined) return ''
-  if (typeof any === 'string') return any
-  if (typeof any === 'number' || typeof any === 'boolean') return String(any)
-  if (Array.isArray(any)) return any.map(v => jsonToValue(v))
-  if (typeof any === 'object') {
-    const result: { [key: string]: Value } = {}
-    for (const [k, v] of Object.entries(any as Record<string, unknown>)) {
-      result[k] = jsonToValue(v)
-    }
-    return result
-  }
-  return String(any)
-}
-
-function emitRoot(value: Value, groupName: string, out: number[]): void {
-  if (typeof value === 'string') {
-    writeGroup(groupName, out)
-    out.push(RS)
-    writeEscaped(value, out)
-  } else if (Array.isArray(value)) {
-    emitArrayAsGroup(value, groupName, out)
-  } else {
-    const hash = value as { [key: string]: Value }
-    if (allScalar(hash)) {
-      writeGroup(groupName, out)
-      for (const [k, v] of Object.entries(hash)) {
-        out.push(RS)
-        writeEscaped(k, out)
-        out.push(US)
-        writeEscaped(v as string, out)
-      }
-    } else if (Object.keys(hash).length === 1) {
-      const key = Object.keys(hash)[0]
-      const inner = hash[key]
-      if (typeof inner === 'object' && !Array.isArray(inner) && allGroupable(inner as { [key: string]: Value })) {
-        out.push(FS)
-        pushString(key, out)
-        emitHashAsGroups(inner as { [key: string]: Value }, out)
-      } else {
-        emitHashAsGroups(hash, out)
-      }
-    } else {
-      emitHashAsGroups(hash, out)
-    }
-  }
-}
-
-function emitHashAsGroups(hash: { [key: string]: Value }, out: number[]): void {
-  for (const [name, value] of Object.entries(hash)) {
-    if (typeof value === 'string') {
-      writeGroup(name, out)
-      out.push(RS)
-      writeEscaped(value, out)
     } else if (Array.isArray(value)) {
-      emitArrayAsGroup(value, name, out)
+      emitArrayAsGroup(b, value, groupName)
     } else {
-      const h = value as { [key: string]: Value }
-      writeGroup(name, out)
-      for (const [k, v] of Object.entries(h)) {
-        out.push(RS)
-        writeEscaped(k, out)
-        out.push(US)
-        emitFieldValue(v, out)
-      }
+      b.group(groupName)
+      b.record(value)
+    }
+  })
+}
+
+function emitGroups(b: Builder, obj: { [key: string]: Value }): void {
+  for (const [name, value] of Object.entries(obj)) {
+    if (isObject(value)) {
+      b.group(name)
+      emitMap(b, value)
+    } else if (Array.isArray(value)) {
+      emitArrayAsGroup(b, value, name)
+    } else {
+      b.group(name)
+      b.record(value)
     }
   }
 }
 
-function emitArrayAsGroup(arr: Value[], name: string, out: number[]): void {
+// An object → one keyed record, entries in object order.
+function emitMap(b: Builder, obj: { [key: string]: Value }): void {
+  b.record()
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string') b.key(k, v)
+    else b.key(k, () => emitLevelBody(b, v))
+  }
+}
+
+function emitArrayAsGroup(b: Builder, arr: Value[], name: string): void {
   if (tabular(arr)) {
     const headers = Object.keys(arr[0] as { [key: string]: Value })
-    writeGroup(name, out)
-    out.push(SOH)
-    for (let i = 0; i < headers.length; i++) {
-      if (i > 0) out.push(US)
-      pushString(headers[i], out)
-    }
+    b.group(name, headers)
     for (const row of arr) {
       const h = row as { [key: string]: Value }
-      out.push(RS)
-      for (let i = 0; i < headers.length; i++) {
-        if (i > 0) out.push(US)
-        emitFieldValue(h[headers[i]] ?? '', out)
-      }
+      b.record()
+      for (const k of headers) emitUnit(b, k in h ? h[k] : '')
     }
   } else {
-    writeGroup(name, out)
-    for (const item of arr) {
-      if (typeof item === 'string') {
-        out.push(RS)
-        writeEscaped(item, out)
-      } else if (Array.isArray(item)) {
-        out.push(RS)
-        for (let i = 0; i < item.length; i++) {
-          if (i > 0) out.push(US)
-          emitFieldValue(item[i], out)
-        }
-      } else {
-        const h = item as { [key: string]: Value }
-        for (const [k, v] of Object.entries(h)) {
-          out.push(RS)
-          writeEscaped(k, out)
-          out.push(US)
-          emitFieldValue(v, out)
-        }
-      }
-    }
+    b.group(name)
+    for (const item of arr) emitItemAsRecord(b, item)
   }
 }
 
-function emitFieldValue(value: Value, out: number[]): void {
-  if (typeof value === 'string') {
-    writeEscaped(value, out)
+function emitItemAsRecord(b: Builder, item: Value): void {
+  if (typeof item === 'string') {
+    b.record(item)
+  } else if (Array.isArray(item)) {
+    b.record()
+    for (const v of item) emitUnit(b, v)
+  } else {
+    emitMap(b, item)
+  }
+}
+
+// A value in unit position: scalar, or a level.
+function emitUnit(b: Builder, value: Value): void {
+  if (typeof value === 'string') b.field(value)
+  else b.level(() => emitLevelBody(b, value))
+}
+
+// Inside a level: an array of scalars is one record (a list); an array of
+// uniform objects a table with a header row; an array of arrays a table;
+// a mixed array one record per item; an object a map.
+function emitLevelBody(b: Builder, value: Value): void {
+  if (isObject(value)) {
+    emitMap(b, value)
   } else if (Array.isArray(value)) {
-    out.push(STX)
-    for (const item of value) {
-      out.push(US)
-      emitFieldValue(item, out)
-    }
-    out.push(ETX)
-  } else {
-    const h = value as { [key: string]: Value }
-    out.push(STX)
-    for (const [k, v] of Object.entries(h)) {
-      out.push(RS)
-      writeEscaped(k, out)
-      out.push(US)
-      emitFieldValue(v, out)
-    }
-    out.push(ETX)
-  }
-}
-
-// --- Helpers ---
-
-const enc = new TextEncoder()
-
-function writeGroup(name: string, out: number[]): void {
-  out.push(GS)
-  pushString(name, out)
-}
-
-function pushString(s: string, out: number[]): void {
-  const bytes = enc.encode(s)
-  for (const b of bytes) out.push(b)
-}
-
-function writeEscaped(str: string, out: number[]): void {
-  const bytes = enc.encode(str)
-  for (const b of bytes) {
-    if (b < 0x20) out.push(DLE)
-    out.push(b)
-  }
-}
-
-function unescape(field: Uint8Array): string {
-  let hasDLE = false
-  for (let i = 0; i < field.length; i++) {
-    if (field[i] === DLE) { hasDLE = true; break }
-  }
-  if (!hasDLE) return decoder.decode(field)
-
-  const out: number[] = []
-  let pos = 0
-  while (pos < field.length) {
-    if (field[pos] === DLE && pos + 1 < field.length) {
-      pos++
-      out.push(field[pos])
+    if (value.every(v => typeof v === 'string')) {
+      b.record()
+      for (const v of value) b.field(v as string)
+    } else if (tabular(value)) {
+      const headers = Object.keys(value[0] as { [key: string]: Value })
+      b.header(headers)
+      for (const row of value) {
+        const h = row as { [key: string]: Value }
+        b.record()
+        for (const k of headers) emitUnit(b, k in h ? h[k] : '')
+      }
+    } else if (value.every(v => Array.isArray(v))) {
+      for (const row of value) {
+        b.record()
+        for (const v of row as Value[]) emitUnit(b, v)
+      }
     } else {
-      out.push(field[pos])
+      for (const item of value) emitItemAsRecord(b, item)
     }
-    pos++
+  } else {
+    b.record(value)
   }
-  return decoder.decode(new Uint8Array(out))
 }
 
-function allScalar(hash: { [key: string]: Value }): boolean {
-  return Object.values(hash).every(v => typeof v === 'string')
-}
-
-function allGroupable(hash: { [key: string]: Value }): boolean {
-  return Object.values(hash).every(v => typeof v === 'object')
+function allGroupable(obj: { [key: string]: Value }): boolean {
+  const values = Object.values(obj)
+  return values.length > 0 && values.every(v => typeof v === 'object')
 }
 
 function tabular(arr: Value[]): boolean {
   if (arr.length === 0) return false
-  if (!arr.every(item => typeof item === 'object' && !Array.isArray(item))) return false
-  const keys = Object.keys(arr[0] as { [key: string]: Value })
-  return arr.every(item => {
-    const k = Object.keys(item as { [key: string]: Value })
-    return k.length === keys.length && k.every((key, i) => key === keys[i])
-  })
+  if (!arr.every(isObject)) return false
+  const keys = Object.keys(arr[0] as object).join('\u001f')
+  return arr.every(item => Object.keys(item as object).join('\u001f') === keys)
 }

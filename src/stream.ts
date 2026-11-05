@@ -1,180 +1,263 @@
-import { DLE, ETB, STX, ETX } from './constants.js'
-import { Table, Record } from './table.js'
-import { Builder } from './builder.js'
-
 /**
- * Stream mode: ETB commits for append-only logs.
+ * Stream mode: ETB-committed append logs (DESIGN.md "Stream Mode").
  *
- * C0DATA records are start-delimited, so a crashed append leaves a
- * truncated final record indistinguishable from a complete one. In
- * stream mode every appended block (one or more records, or an SOH
- * header) is terminated by an ETB commit marker. A block is complete
- * if and only if it is terminated by ETB.
+ *   const log = await openLog('events.c0')
+ *   log.start()                               // SYN ␁shape␟stream ␗ on a new log
+ *   log.record('create', 'a1b2', '1718208000')
+ *   log.close()
+ *   const r = await readLog('events.c0')
+ *   r.torn                                    // false
+ *   r.eachRecord(rec => { ... })
  */
+import { STX, ETX, EOT, BEL, DLE, SYN, ETB, CAN, EM, SP } from './constants.js'
+import { scanLayout, scanComment } from './core.js'
+import { C0Error } from './error.js'
+import { Body, Group, Record } from './body.js'
+import { Document } from './document.js'
+import { Builder, type BuilderValue, type Pairs } from './builder.js'
+import { ByteWriter, EMPTY } from './bytes.js'
 
 /**
- * Scans a buffer for ETB commit markers and exposes only the
- * committed region. Zero-copy: accessors return subarrays.
- *
- *   const reader = new StreamReader(buf)
- *   reader.torn                       // uncommitted tail present?
- *   reader.eachRecord(rec => { ... }) // committed records only
+ * Scans a buffer for commits. An unescaped ETB is always a commit, even
+ * inside open text or a level; such a block is damaged and yields
+ * nothing. The tail after the last commit is torn unless it holds only
+ * layout, notes or EOT.
  */
 export class StreamReader {
   readonly buf: Uint8Array
-  private commits: [number, number][] = [] // [etb offset, end of payload]
+  /** [start, end) of each committed block (ETB excluded). */
+  readonly blocks: [number, number][] = []
+  /** Indexes of damaged blocks. */
+  readonly damaged: number[] = []
+  readonly torn: boolean
+  private _committedEnd = 0
 
   constructor(buf: Uint8Array) {
     this.buf = buf
     this.scan()
+    this.torn = this.tornTail()
   }
 
-  /** Offset just past the last commit marker and its payload. */
+  /** Offset just past the last ETB and its payload. */
   get committedEnd(): number {
-    return this.commits.length === 0 ? 0 : this.commits[this.commits.length - 1][1]
+    return this._committedEnd
   }
 
-  /** The committed region of the buffer. */
   get committed(): Uint8Array {
-    return this.buf.subarray(0, this.committedEnd)
+    return this.buf.subarray(0, this._committedEnd)
   }
 
-  /** Uncommitted trailing bytes — residue of an interrupted append. */
   get tail(): Uint8Array {
-    return this.buf.subarray(this.committedEnd)
+    return this.buf.subarray(this._committedEnd)
   }
 
-  /** True if uncommitted bytes trail the last commit marker. */
-  get torn(): boolean {
-    return this.committedEnd < this.buf.length
-  }
-
-  /** Number of committed blocks. */
   get blockCount(): number {
-    return this.commits.length
+    return this.blocks.length
   }
 
-  /**
-   * Committed block by index: the bytes between the previous commit
-   * and this block's ETB (marker and payload excluded).
-   */
   block(i: number): Uint8Array {
-    const start = i === 0 ? 0 : this.commits[i - 1][1]
-    return this.buf.subarray(start, this.commits[i][0])
+    const [s, e] = this.blocks[i]
+    return this.buf.subarray(s, e)
   }
 
-  /** Iterate committed blocks. */
-  eachBlock(cb: (block: Uint8Array) => void): void {
-    for (let i = 0; i < this.commits.length; i++) cb(this.block(i))
+  isDamaged(i: number): boolean {
+    return this.damaged.includes(i)
   }
 
-  /**
-   * The committed region as a Table (handles an optional GS name and
-   * SOH header, then RS records).
-   */
-  get table(): Table {
-    return new Table(this.committed)
+  eachBlock(cb: (block: Uint8Array, i: number) => void): void {
+    for (let i = 0; i < this.blocks.length; i++) cb(this.block(i), i)
   }
 
-  /** Iterate committed records. */
-  eachRecord(cb: (rec: Record) => void): void {
-    this.table.eachRecord(cb)
+  /** The committed region as a document (heading skipped), undamaged blocks only. */
+  get document(): Document {
+    return new Document(this.undamagedBytes())
   }
 
-  // Find every ETB at structural level: DLE-escaped bytes are data,
-  // and ETB inside an STX/ETX scope is record content, not a commit.
+  get body(): Body {
+    return this.document.body
+  }
+
+  /** Compatibility: the committed records as a group (the first one). */
+  get table(): Group {
+    const b = this.body
+    return b.groups[0] ?? new Group(EMPTY, 0, 0, 0, undefined, [])
+  }
+
+  eachRecord(cb: (r: Record) => void): void {
+    for (const g of this.body.groups) for (const r of g.records) cb(r)
+  }
+
+  get records(): Record[] {
+    const out: Record[] = []
+    this.eachRecord(r => out.push(r))
+    return out
+  }
+
+  // Committed bytes with damaged blocks and payloads removed.
+  private undamagedBytes(): Uint8Array {
+    const io = new ByteWriter()
+    this.blocks.forEach(([s, e], i) => {
+      if (!this.damaged.includes(i)) io.write(this.buf.subarray(s, e))
+    })
+    return io.toUint8Array()
+  }
+
   private scan(): void {
+    const buf = this.buf
+    const len = buf.length
     let pos = 0
-    const len = this.buf.length
-
+    let blockStart = 0
+    let inText = false
+    let depth = 0
     while (pos < len) {
-      const byte = this.buf[pos]
-      if (byte === DLE) {
-        pos += 2
-      } else if (byte === STX) {
-        pos = skipNested(this.buf, pos, len)
-      } else if (byte === ETB) {
-        const etbPos = pos
+      const b = buf[pos]
+      if (inText) {
+        if (b === DLE) {
+          pos += 2
+          continue
+        } else if (b === ETX) {
+          inText = false
+        } else if (b === ETB) {
+          this.commit(blockStart, pos, true)
+          pos = this.payloadEnd(pos + 1)
+          blockStart = pos
+          inText = false
+          depth = 0
+          continue
+        } else if (b === SYN || b === EOT || b === EM) {
+          // framing cuts the text; the block is torn/damaged at the next commit
+          inText = false
+          depth = 0
+          if (b === SYN) blockStart = pos
+        }
         pos++
-        // Payload runs until the next control code
-        while (pos < len && this.buf[pos] >= 0x20) pos++
-        this.commits.push([etbPos, pos])
       } else {
+        if (b === STX) {
+          inText = true
+        } else if (b === DLE) {
+          depth++
+        } else if (b === CAN) {
+          if (depth > 0) depth--
+        } else if (b === ETB) {
+          this.commit(blockStart, pos, depth > 0)
+          pos = this.payloadEnd(pos + 1)
+          blockStart = pos
+          depth = 0
+          continue
+        } else if (b === SYN && pos > 0) {
+          // tears the uncommitted bytes before it; a new document begins
+          blockStart = pos
+          depth = 0
+        }
         pos++
+      }
+    }
+  }
+
+  private commit(start: number, stop: number, damaged: boolean): void {
+    this.blocks.push([start, stop])
+    if (damaged) this.damaged.push(this.blocks.length - 1)
+  }
+
+  // After an ETB: skip its payload and return committedEnd (which excludes
+  // layout after the payload).
+  private payloadEnd(pos: number): number {
+    const buf = this.buf
+    const len = buf.length
+    let p = scanLayout(buf, pos, len)
+    if (p < len && buf[p] >= 0x20) {
+      while (p < len && buf[p] >= 0x20) p++
+      // trailing spaces of the payload are layout
+      while (p > pos && buf[p - 1] === SP) p--
+    } else {
+      p = pos // no payload: layout after ETB belongs to the next block
+    }
+    this._committedEnd = p
+    return p
+  }
+
+  // Is the tail more than layout, notes and EOT?
+  private tornTail(): boolean {
+    const buf = this.buf
+    const len = buf.length
+    let pos = this._committedEnd
+    for (;;) {
+      pos = scanLayout(buf, pos, len)
+      if (pos >= len) return false
+      const b = buf[pos]
+      if (b === EOT) {
+        pos++
+      } else if (b === BEL) {
+        const p2 = scanLayout(buf, pos + 1, len)
+        if (p2 < len && buf[p2] < 0x20 && buf[p2] !== STX) return true // a dead element is data
+        try {
+          pos = scanComment(buf, pos, len)
+        } catch (e) {
+          if (e instanceof C0Error) return true
+          throw e
+        }
+      } else {
+        return true
       }
     }
   }
 }
 
-function skipNested(buf: Uint8Array, pos: number, stop: number): number {
-  pos++ // skip STX
-  let depth = 1
-  while (pos < stop && depth > 0) {
-    const byte = buf[pos]
-    if (byte === STX) depth++
-    else if (byte === ETX) depth--
-    else if (byte === DLE) pos++
-    pos++
-  }
-  return pos
-}
-
-/** Destination for committed blocks (e.g. a file or socket). */
+/** Where a StreamWriter appends its blocks. */
 export interface StreamSink {
-  /** Write one committed block (block bytes + ETB) as a single unit. */
   write(bytes: Uint8Array): void
-  /** Optional durability barrier (e.g. fsync), called after each commit. */
   sync?(): void
+  close?(): void
 }
 
 /**
- * Appends ETB-committed blocks to an append-only log.
- *
- *   const log = new StreamWriter(sink)
- *   log.record('create', nonce, ts)
- *   log.batch(b => {                  // atomic multi-record commit
- *     b.record('name', label, ts)
- *     b.record('tag', tag, ts)
- *   })
- *
- * Each block and its ETB are issued as a single write. When appending
- * to an existing log, repair the tail first (see `openLog`) — blind
- * appends after a torn tail are unsafe (a tail ending in a bare DLE
- * would escape the next append's RS and fuse two records).
+ * Appends committed blocks to a sink. Each `record`, `header`, `group`,
+ * `map` or `batch` is one block, written with its ETB in a single append.
  */
 export class StreamWriter {
-  private sink: StreamSink
+  private readonly sink: StreamSink
 
   constructor(sink: StreamSink) {
     this.sink = sink
   }
 
-  /** Append one record as a committed block. */
-  record(...fields: string[]): void {
-    this.commit(b => { b.recordArray(fields) })
+  /** A new log: SYN and heading, committed. */
+  start(pairs: Pairs = { shape: 'stream' }): void {
+    this.commit(b => { b.syn(pairs) })
   }
 
-  /** Append one record from an array of fields. */
-  recordArray(fields: string[]): void {
-    this.commit(b => { b.recordArray(fields) })
+  record(...fields: BuilderValue[]): void {
+    this.commit(b => { b.record(...fields) })
   }
 
-  /** Append an SOH header as a committed block. */
+  recordArray(fields: BuilderValue[]): void {
+    this.record(...fields)
+  }
+
+  map(pairs: Pairs): void {
+    this.commit(b => { b.map(pairs) })
+  }
+
   header(...names: string[]): void {
     this.commit(b => { b.header(names) })
   }
 
-  /** Append a group preamble (GS + name) as a committed block. */
   group(name: string, headers?: string[] | null): void {
     this.commit(b => { b.group(name, headers) })
   }
 
-  /**
-   * Append several records under a single commit. The batch is
-   * atomic: a tear anywhere inside it discards the whole block.
-   */
+  /** Several writes under one ETB: atomic as a batch. */
   batch(fn: (b: Builder) => void): void {
     this.commit(fn)
+  }
+
+  flush(): void {
+    this.sink.sync?.()
+  }
+
+  close(): void {
+    this.flush()
+    this.sink.close?.()
   }
 
   private commit(fn: (b: Builder) => void): void {
@@ -182,43 +265,57 @@ export class StreamWriter {
     fn(b)
     b.etb()
     this.sink.write(b.toUint8Array())
-    this.sink.sync?.()
+    this.flush()
   }
 }
 
 /** A StreamWriter over a log file. Close when done. */
-export interface FileLog extends StreamWriter {
-  close(): void
+export type FileLog = StreamWriter
+
+/** Truncate an uncommitted tail so the file ends at a commit (Node only). */
+export async function repairLog(path: string): Promise<void> {
+  const fs = await import('node:fs')
+  const reader = new StreamReader(fs.readFileSync(path))
+  if (reader.torn) fs.truncateSync(path, reader.committedEnd)
 }
 
 /**
  * Open an append-only log file (Node only), repairing any torn tail
- * first by truncating to the last commit marker. With `sync: true`
- * (the default) every commit is fsync'd.
+ * first. With `sync: true` (the default) every commit is fsync'd.
  */
 export async function openLog(path: string, opts?: { sync?: boolean }): Promise<FileLog> {
   const fs = await import('node:fs')
-
-  // Repair: truncate an uncommitted tail so the log ends at a commit
-  if (fs.existsSync(path)) {
-    const reader = new StreamReader(fs.readFileSync(path))
-    if (reader.torn) {
-      fs.truncateSync(path, reader.committedEnd)
-    }
-  }
-
+  if (fs.existsSync(path)) await repairLog(path)
   const fd = fs.openSync(path, 'a')
   const wantSync = opts?.sync ?? true
-  const writer = new StreamWriter({
+  return new StreamWriter({
     write: bytes => { fs.writeSync(fd, bytes) },
     sync: wantSync ? () => { fs.fsyncSync(fd) } : undefined,
-  }) as FileLog
-  writer.close = () => { fs.closeSync(fd) }
-  return writer
+    close: () => { fs.closeSync(fd) },
+  })
 }
 
 /** Read a log file (Node only) into a StreamReader. */
 export async function readLog(path: string): Promise<StreamReader> {
   const fs = await import('node:fs')
   return new StreamReader(fs.readFileSync(path))
+}
+
+/**
+ * Position just past the last commit, found by scanning backward (a
+ * shortcut for well-formed input; the forward scan is authoritative).
+ */
+export function lastCommitEnd(buf: Uint8Array): number {
+  for (let i = buf.length - 1; i >= 0; i--) {
+    if (buf[i] !== ETB) continue
+    // count the DLE run before it: odd means escaped
+    let dles = 0
+    for (let j = i - 1; j >= 0 && buf[j] === DLE; j--) dles++
+    if (dles % 2 === 0) {
+      let p = i + 1
+      while (p < buf.length && buf[p] >= 0x20) p++
+      return p
+    }
+  }
+  return 0
 }
