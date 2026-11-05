@@ -1,726 +1,543 @@
 import { describe, it } from 'node:test'
-import * as assert from 'node:assert/strict'
+import assert from 'node:assert/strict'
 import {
-  SOH, STX, ETX, EOT, ENQ, DLE, SUB, FS, GS, RS, US,
-  tokenize, tokenizeEach, TokenType,
-  Builder, build,
-  Table, Record as C0Record,
-  Document,
-  glyph, format, parse, align,
-  fromCSV, toCSV,
-  toJSON, fromJSON, toObject, fromObject,
+  SOH, STX, ETX, EOT, ENQ, BEL, DLE, SYN, ETB, CAN, EM, SUB, FS, GS, RS, US,
+  C0Error, C0SyntaxError, KeyError,
+  value, isPlain, encodeValue, decodeText,
+  validate, canonical,
+  Body, Record as C0Record, Document, Container,
+  build, Builder,
+  glyph, format, parse, align, GlyphInDataError,
+  tokenize, TokenType,
+  fromCSV, toCSV, parseCSV,
+  toJSON, toObject, fromJSON, fromObject,
   parseDiff, applyDiff, buildDiff,
-  C0Error, UnassignedCodeError, UnexpectedEndError,
+  utf8, toHex, ByteWriter,
 } from './index.js'
 
 const enc = new TextEncoder()
-const dec = new TextDecoder()
 
-/** Helper to build byte buffers from control codes and strings. */
+function concat(parts: Uint8Array[]): Uint8Array {
+  const w = new ByteWriter()
+  for (const p of parts) w.write(p)
+  return w.toUint8Array()
+}
+
+/** Build a byte buffer from control codes and strings. */
 function buf(...parts: (number | string)[]): Uint8Array {
   const out: number[] = []
   for (const p of parts) {
     if (typeof p === 'number') out.push(p)
-    else for (const b of enc.encode(p)) out.push(b)
+    else out.push(...enc.encode(p))
   }
   return new Uint8Array(out)
 }
 
+/** Compact bytes from a pretty-form string. */
+function g(pretty: string): Uint8Array {
+  return parse(pretty)
+}
+
 // ============================================================
-// Tokenizer
+// Values
 // ============================================================
-describe('Tokenizer', () => {
-  it('emits a single data token for plain text', () => {
-    const tokens = tokenize(enc.encode('hello'))
-    assert.equal(tokens.length, 1)
-    assert.equal(tokens[0].type, TokenType.Data)
-    assert.equal(dec.decode(enc.encode('hello').subarray(tokens[0].start, tokens[0].end)), 'hello')
+
+describe('values', () => {
+  it('plain iff no byte below 0x20 and no edge whitespace', () => {
+    assert.equal(isPlain(enc.encode('Alice Smith')), true)
+    assert.equal(isPlain(enc.encode('')), true)
+    assert.equal(isPlain(enc.encode(' Alice')), false)
+    assert.equal(isPlain(enc.encode('a\tb')), false)
+    assert.equal(isPlain(buf('a', US, 'b')), false)
   })
 
-  it('handles empty input', () => {
-    assert.deepEqual(tokenize(new Uint8Array(0)), [])
+  it('writes one spelling per value, escaping only the seven codes', () => {
+    assert.deepEqual(encodeValue('only'), enc.encode('only'))
+    assert.deepEqual(encodeValue(' x '), buf(STX, ' x ', ETX))
+    assert.deepEqual(encodeValue(buf('a', US, 'b')), buf(STX, 'a', US, 'b', ETX))
+    assert.deepEqual(encodeValue(buf('a', ETB, STX, ETX, DLE, EOT, SYN, EM)),
+      buf(STX, 'a', DLE, ETB, DLE, STX, DLE, ETX, DLE, DLE, DLE, EOT, DLE, SYN, DLE, EM, ETX))
   })
 
-  it('emits control code tokens', () => {
-    const tests: [number, TokenType][] = [
-      [FS, TokenType.FS], [GS, TokenType.GS], [RS, TokenType.RS], [US, TokenType.US],
-      [SOH, TokenType.SOH], [STX, TokenType.STX], [ETX, TokenType.ETX],
-      [EOT, TokenType.EOT], [ENQ, TokenType.ENQ], [SUB, TokenType.SUB],
-    ]
-    for (const [byte, expected] of tests) {
-      const tokens = tokenize(new Uint8Array([byte]))
-      assert.equal(tokens.length, 1, `byte 0x${byte.toString(16)}`)
-      assert.equal(tokens[0].type, expected, `byte 0x${byte.toString(16)}`)
-    }
+  it('reads a plain value with its edge layout trimmed and a text decoded', () => {
+    assert.equal(utf8(value(enc.encode(' Alice '))), 'Alice')
+    assert.deepEqual(value(buf(STX, 'a', DLE, ETB, 'b', ETX)), buf('a', ETB, 'b'))
+    assert.deepEqual(value(buf(STX, ETX)), new Uint8Array(0))
   })
 
-  it('tokenizes a simple table', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30')
-    const tokens = tokenize(data)
-    const types = tokens.map(t => t.type)
-    assert.deepEqual(types, [
-      TokenType.GS, TokenType.Data, TokenType.SOH,
-      TokenType.Data, TokenType.US, TokenType.Data,
-      TokenType.RS, TokenType.Data, TokenType.US, TokenType.Data,
-    ])
+  it('a note in a unit is skipped; a note alone is the empty value', () => {
+    assert.equal(utf8(value(buf('x', BEL, 'old'))), 'x')
+    assert.equal(value(buf(BEL, 'old')).length, 0)
   })
 
-  it('escapes a control code as data via DLE', () => {
-    const data = buf(DLE, RS) // DLE + RS → data token for RS byte
-    const tokens = tokenize(data)
-    assert.equal(tokens.length, 1)
-    assert.equal(tokens[0].type, TokenType.Data)
-    assert.equal(data[tokens[0].start], RS)
+  it('rejects layout inside a plain value and text glued to plain', () => {
+    assert.throws(() => value(buf('a\tb')), C0SyntaxError)
+    assert.throws(() => value(buf('abc', STX, ' x ', ETX, 'def')), C0SyntaxError)
   })
 
-  it('raises UnexpectedEndError on trailing DLE', () => {
-    assert.throws(() => tokenize(new Uint8Array([DLE])), UnexpectedEndError)
-  })
-
-  it('rejects unassigned control codes', () => {
-    assert.throws(() => tokenize(new Uint8Array([0x07])), UnassignedCodeError) // BEL
-    assert.throws(() => tokenize(new Uint8Array([0x00])), UnassignedCodeError) // NUL
-  })
-
-  it('allows DEL (0x7F) as data', () => {
-    const tokens = tokenize(new Uint8Array([0x7f]))
-    assert.equal(tokens.length, 1)
-    assert.equal(tokens[0].type, TokenType.Data)
-  })
-
-  it('handles consecutive delimiters (empty fields)', () => {
-    const data = buf(RS, US, US) // record with two empty fields + third empty
-    const tokens = tokenize(data)
-    assert.deepEqual(tokens.map(t => t.type), [TokenType.RS, TokenType.US, TokenType.US])
-  })
-
-  it('handles UTF-8 data', () => {
-    const data = buf(RS, '日本語', US, '🎉')
-    const tokens = tokenize(data)
-    assert.equal(tokens.length, 4)
-    assert.equal(tokens[0].type, TokenType.RS)
-    assert.equal(dec.decode(data.subarray(tokens[1].start, tokens[1].end)), '日本語')
-    assert.equal(tokens[2].type, TokenType.US)
-    assert.equal(dec.decode(data.subarray(tokens[3].start, tokens[3].end)), '🎉')
-  })
-
-  it('handles multiple GS for depth', () => {
-    const data = buf(GS, GS, 'section')
-    const tokens = tokenize(data)
-    assert.deepEqual(tokens.map(t => t.type), [TokenType.GS, TokenType.GS, TokenType.Data])
+  it('decodeText is zero-copy without escapes', () => {
+    const inside = enc.encode('hello')
+    assert.equal(decodeText(inside), inside)
   })
 })
 
 // ============================================================
 // Builder
 // ============================================================
+
 describe('Builder', () => {
-  it('builds a simple table', () => {
-    const data = build(b => {
-      b.group('users', ['name', 'age'], () => {
-        b.record('Alice', '30')
-        b.record('Bob', '25')
+  it('builds the full database example', () => {
+    const bytes = build(b => {
+      b.syn()
+      b.file('mydb')
+      b.group('users', ['name', 'amount', 'type'], () => {
+        b.record('Alice', '1502.30', 'DEPOSIT')
+        b.record('Bob', '340.00', 'WITHDRAWAL')
       })
+      b.group('products', ['id', 'product', 'qty'])
+      b.record('01', 'Widget', '100')
+      b.eot()
     })
-    const table = new Table(data)
-    assert.equal(dec.decode(table.name), 'users')
-    assert.equal(table.headerCount, 2)
-    assert.equal(dec.decode(table.header(0)), 'name')
-    assert.equal(dec.decode(table.header(1)), 'age')
-    assert.equal(table.recordCount, 2)
-    assert.equal(dec.decode(table.record(0).field(0)), 'Alice')
-    assert.equal(dec.decode(table.record(0).field(1)), '30')
+    assert.deepEqual(bytes, g('␖␜mydb␝users␁␞name␟amount␟type␞Alice␟1502.30␟DEPOSIT␞Bob␟340.00␟WITHDRAWAL␝products␁␞id␟product␟qty␞01␟Widget␟100␄'))
   })
 
-  it('builds a full database with multiple tables', () => {
-    const data = build(b => {
-      b.file('mydb', () => {
-        b.group('users', ['name', 'age'], () => {
-          b.record('Alice', '30')
-        })
-        b.group('config')
+  it('writes a SYN heading with keys in the order given', () => {
+    assert.deepEqual(build(b => b.syn({ shape: 'stream', version: '1' })), g('␖␁shape␟stream␁version␟1'))
+    assert.deepEqual(build(b => b.syn([['version', '1'], ['shape', 'stream']])), g('␖␁version␟1␁shape␟stream'))
+  })
+
+  it('writes keyed records in order and keeps values byte-transparent', () => {
+    const bytes = build(b => {
+      b.group('database')
+      b.map({ host: 'localhost', port: '5432' })
+      b.record().key('a', ' x ').key('b', buf(0x00, 0xff))
+    })
+    assert.deepEqual(bytes, buf(GS, 'database', RS, SOH, 'host', US, 'localhost', SOH, 'port', US, '5432',
+      RS, SOH, 'a', US, STX, ' x ', ETX, SOH, 'b', US, STX, 0x00, 0xff, ETX))
+  })
+
+  it('nests levels, lists and maps', () => {
+    const bytes = build(b => {
+      b.record('Alice')
+      b.list(['Admin', 'Editor'])
+      b.list([])
+      b.level(() => {
+        b.header('street', 'city')
+        b.record('123 Main', 'Springfield')
       })
+      b.key('ignored-not-mixed-here', 'x') // keyed unit on a new record below
     })
-    const tokens = tokenize(data)
-    assert.equal(tokens[0].type, TokenType.FS)
+    // the last key continued the open positional record: the caller's business; check the prefix
+    const want = g('␞Alice␟␐␞Admin␟Editor␘␟␐␘␟␐␁␞street␟city␞123 Main␟Springfield␘')
+    assert.deepEqual(bytes.subarray(0, want.length), want)
   })
 
-  it('escapes control codes in field values', () => {
-    const data = build(b => {
-      b.group('test', null, () => {
-        b.record('line1\x1eline2') // contains RS
-      })
-    })
-    const table = new Table(data)
-    assert.equal(table.recordCount, 1)
-    // The escaped field should survive round-trip
+  it('writes references as a name or a text path', () => {
+    assert.deepEqual(build(b => b.record('My Post').ref('tags').ref('tags', '001')),
+      buf(RS, 'My Post', US, ENQ, 'tags', US, ENQ, STX, 'tags', US, '001', ETX))
+    assert.throws(() => build(b => b.ref('tags', ' x')), C0Error)
+    assert.throws(() => build(b => b.ref('a', 'b', 'c', 'd')), C0Error)
   })
 
-  it('builds document-mode sections', () => {
-    const data = build(b => {
-      b.section('chapter', 1, () => {
-        b.section('subsection', 2, () => {
-          b.block('content here')
-        })
-      })
-    })
-    const tokens = tokenize(data)
-    // First token should be GS (depth 1)
-    assert.equal(tokens[0].type, TokenType.GS)
+  it('refuses names that are not identifiers', () => {
+    assert.throws(() => build(b => b.group(' users')), C0Error)
+    assert.throws(() => build(b => b.header(['a\tb'])), C0Error)
+    assert.throws(() => build(b => b.key('k ', 'v')), C0Error)
   })
 
-  it('builds key-value config', () => {
-    const data = build(b => {
-      b.group('config', null, () => {
-        b.record('host', 'localhost')
-        b.record('port', '8080')
-      })
-    })
-    const table = new Table(data)
-    assert.equal(table.recordCount, 2)
-    assert.equal(dec.decode(table.record(0).field(0)), 'host')
-    assert.equal(dec.decode(table.record(0).field(1)), 'localhost')
+  it('writes notes, commits and the EM tail', () => {
+    assert.deepEqual(build(b => b.note('see the runbook').record('a').etb('sha256:00').em(buf('raw'))),
+      buf(BEL, 'see the runbook', RS, 'a', ETB, 'sha256:00', EM, 'raw'))
+    assert.deepEqual(build(b => b.note(' spaced ')), buf(BEL, STX, ' spaced ', ETX))
   })
 
-  it('builds references', () => {
-    const data = build(b => {
-      b.ref('users')
+  it('output is canonical', () => {
+    const bytes = build(b => {
+      b.group('g', ['a', 'b'])
+      b.record('1', ' 2 ')
+      b.map({ k: 'v' })
     })
-    const tokens = tokenize(data)
-    assert.equal(tokens[0].type, TokenType.ENQ)
-    assert.equal(tokens[1].type, TokenType.Data)
-  })
-
-  it('builds path references', () => {
-    const data = build(b => {
-      b.ref('users', 'alice', 'name')
-    })
-    const tokens = tokenize(data)
-    assert.equal(tokens[0].type, TokenType.ENQ)
-    assert.equal(tokens[1].type, TokenType.STX)
+    assert.equal(canonical(bytes), true)
   })
 })
 
 // ============================================================
-// Table
+// Body / Record
 // ============================================================
-describe('Table', () => {
-  it('reads group name', () => {
-    const data = buf(GS, 'users', SOH, 'name', RS, 'Alice')
-    const table = new Table(data)
-    assert.equal(dec.decode(table.name), 'users')
+
+describe('Body', () => {
+  it('indexes files, groups, header rows and records', () => {
+    const body = new Body(g('␜mydb␝users␁␞name␟amount␞Alice␟1502.30␞Bob␟340.00␝products␞01␟Widget'))
+    assert.equal(utf8(body.name), 'mydb')
+    assert.equal(body.groupCount, 2)
+    assert.deepEqual(body.groupNames.map(utf8), ['users', 'products'])
+    const users = body.group('users')
+    assert.deepEqual(users.headers.map(utf8), ['name', 'amount'])
+    assert.equal(users.recordCount, 2)
+    assert.deepEqual(users.record(1).strings, ['Bob', '340.00'])
+    assert.equal(users.column('amount'), 1)
+    assert.equal(users.column('nope'), -1)
+    assert.equal(body.group(1).hasHeader, false)
+    assert.throws(() => body.group('nope'), KeyError)
   })
 
-  it('reads SOH headers', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30')
-    const table = new Table(data)
-    assert.equal(table.headerCount, 2)
-    assert.equal(dec.decode(table.header(0)), 'name')
-    assert.equal(dec.decode(table.header(1)), 'age')
+  it('a bare record stream is one unnamed file and group', () => {
+    const body = new Body(g('␞a␟b␞c'))
+    assert.equal(body.bare, true)
+    assert.equal(body.recordCount, 2)
+    assert.deepEqual(body.record(0).strings, ['a', 'b'])
   })
 
-  it('reads records and fields', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30', RS, 'Bob', US, '25')
-    const table = new Table(data)
-    assert.equal(table.recordCount, 2)
-    assert.equal(dec.decode(table.record(0).field(0)), 'Alice')
-    assert.equal(dec.decode(table.record(0).field(1)), '30')
-    assert.equal(dec.decode(table.record(1).field(0)), 'Bob')
+  it('counts units by separators and reads an empty record as one empty field', () => {
+    assert.equal(new Body(g('␞Alice␟')).record(0).fieldCount, 2)
+    assert.equal(new Body(g('␞')).record(0).fieldCount, 1)
+    assert.equal(new Body(g('␞Alice␟␇old␟100')).record(0).fieldCount, 3)
+    assert.equal(new Body(g('␞a␇n␟b')).record(0).fieldCount, 2)
   })
 
-  it('handles table without SOH header', () => {
-    const data = buf(GS, 'config', RS, 'host', US, 'localhost')
-    const table = new Table(data)
-    assert.equal(table.headerCount, 0)
-    assert.equal(table.recordCount, 1)
+  it('whitespace touching a code is layout', () => {
+    const body = new Body(g('  ␝ users \n  ␁␞ name ␟ amount \n  ␞ Alice Smith ␟ 100 \n'))
+    const grp = body.group('users')
+    assert.deepEqual(grp.headers.map(utf8), ['name', 'amount'])
+    assert.deepEqual(grp.record(0).strings, ['Alice Smith', '100'])
   })
 
-  it('stops at next GS boundary', () => {
-    const data = buf(GS, 'a', RS, '1', GS, 'b', RS, '2')
-    const table = new Table(data)
-    assert.equal(dec.decode(table.name), 'a')
-    assert.equal(table.recordCount, 1)
+  it('reads keyed records in order, last wins on duplicates', () => {
+    const rec = new Body(g('␞␁host␟localhost␁port␟5432␁host␟db')).record(0)
+    assert.equal(rec.keyed, true)
+    assert.deepEqual(rec.keys.map(utf8), ['host', 'port', 'host'])
+    assert.equal(rec.getString('host'), 'db')
+    assert.equal(rec.getString('port'), '5432')
+    assert.equal(rec.has('nope'), false)
+    assert.equal(rec.fieldCount, 0)
   })
 
-  it('stops at EOT', () => {
-    const data = buf(GS, 'a', RS, '1', EOT)
-    const table = new Table(data)
-    assert.equal(table.recordCount, 1)
+  it('reads levels, lists and references', () => {
+    const rec = new Body(g('␞Alice␟␐␞Admin␟Editor␘␟␐␘␟␐␁␞street␟city␞1 Main␟Springfield␘␟␅tags␟␅␂tags␟001␟label␃')).record(0)
+    assert.deepEqual(rec.list(1).map(utf8), ['Admin', 'Editor'])
+    assert.deepEqual(rec.list(2), [])
+    const lvl = rec.level(3)
+    assert.deepEqual(lvl.group(0).headers.map(utf8), ['street', 'city'])
+    assert.deepEqual(lvl.group(0).record(0).strings, ['1 Main', 'Springfield'])
+    assert.throws(() => new Body(g('␞␐␞1␟2␞3␟4␘')).record(0).list(0), C0Error)
+    assert.deepEqual(rec.ref(4).segments, ['tags'])
+    assert.equal(rec.ref(4).isGroup, true)
+    assert.deepEqual(rec.ref(5).segments, ['tags', '001', 'label'])
+    assert.throws(() => rec.value(3), C0SyntaxError)
   })
 
-  it('handles empty fields', () => {
-    const data = buf(GS, 'test', RS, US, US, 'x')
-    const table = new Table(data)
-    const rec = table.record(0)
-    assert.equal(rec.fieldCount, 3)
-    assert.equal(dec.decode(rec.field(0)), '')
-    assert.equal(dec.decode(rec.field(1)), '')
-    assert.equal(dec.decode(rec.field(2)), 'x')
+  it('a map under a key', () => {
+    const rec = new Body(g('␞␁server␟␐␞␁host␟0.0.0.0␁port␟8080␘')).record(0)
+    const inner = rec.keyLevel('server')!.record(0)
+    assert.equal(inner.getString('port'), '8080')
   })
 
-  it('handles DLE-escaped bytes', () => {
-    const data = buf(GS, 'test', RS, 'a', DLE, RS, 'b')
-    const table = new Table(data)
-    const rec = table.record(0)
-    // The field contains 'a' + literal RS + 'b' in raw bytes
-    assert.equal(rec.fieldCount, 1)
+  it('skips notes and dead elements, keeping scanning properties', () => {
+    const body = new Body(g('␇ see the runbook␇␞port␟5432␝server␇␁␞name␟amount␞Alice␟␇␐␞Admin␘␟100␇␝gone␞Bob'))
+    assert.equal(body.groupCount, 1)
+    const grp = body.group('server')
+    assert.equal(grp.hasHeader, false)
+    assert.equal(grp.recordCount, 2)
+    assert.deepEqual(grp.record(0).strings, ['Alice', '', '100'])
+    assert.deepEqual(grp.record(1).strings, ['Bob'])
   })
 
-  it('iterates records', () => {
-    const data = buf(GS, 'test', RS, 'a', RS, 'b', RS, 'c')
-    const table = new Table(data)
-    const values: string[] = []
-    table.eachRecord(rec => values.push(dec.decode(rec.field(0))))
-    assert.deepEqual(values, ['a', 'b', 'c'])
+  it('GS repetition is depth', () => {
+    const groups = new Body(g('␝Chapter 1␞p1␝␝Section 1.1␞p2␝␝␝Sub␞p3␝Chapter 2')).groups
+    assert.deepEqual(groups.map(x => x.depth), [1, 2, 3, 1])
+    assert.deepEqual(groups.map(x => utf8(x.name)), ['Chapter 1', 'Section 1.1', 'Sub', 'Chapter 2'])
+  })
+
+  it('a dead file line keeps its contents in the previous file', () => {
+    const body = new Body(g('␜a␝x␞1␇␜b␞2␝y'))
+    assert.equal(body.files.length, 1)
+    assert.deepEqual(body.files[0].groups.map(x => utf8(x.name)), ['x', 'y'])
+    assert.deepEqual(body.files[0].groups[0].records.map(r => r.string(0)), ['1', '2'])
+    const lead = new Body(g('␇␜b␝y'))
+    assert.equal(lead.files.length, 1)
+    assert.deepEqual(lead.files[0].groups.map(x => utf8(x.name)), ['y'])
   })
 })
 
 // ============================================================
-// Document
+// Document / Container
 // ============================================================
+
 describe('Document', () => {
-  it('reads file name', () => {
-    const data = buf(FS, 'mydb', GS, 'users', RS, 'Alice')
-    const doc = new Document(data)
-    assert.equal(dec.decode(doc.name), 'mydb')
+  it('reads the heading and warns on missing markers', () => {
+    const doc = new Document(g('␖␁shape␟tabular␁version␟1␁x␟y␜db␝g␞a␄'))
+    assert.equal(doc.hasSyn, true)
+    assert.equal(doc.hasEot, true)
+    assert.equal(doc.shape, 'tabular')
+    assert.equal(doc.heading.version, 1)
+    assert.deepEqual(doc.warnings, ["unknown heading key 'x'"])
+    assert.equal(utf8(doc.name), 'db')
+    assert.equal(doc.group('g').recordCount, 1)
+
+    const slice = new Document(g('␝g␞a'))
+    assert.deepEqual(slice.warnings, ['no SYN at the start of the document', 'no EOT at the end of the document'])
+    assert.equal(new Document(g('␖␁shape␟stream␞a␗')).warnings.length, 0)
   })
 
-  it('finds all top-level groups', () => {
-    const data = buf(FS, 'db', GS, 'users', RS, 'Alice', GS, 'config', RS, 'k', US, 'v')
-    const doc = new Document(data)
-    assert.equal(doc.groupCount, 2)
+  it('a heading value may be a level, never a reference', () => {
+    const doc = new Document(g('␖␁blob␟␐␁␞name␟offset␟length␞lamp␟0␟3␘␄'))
+    assert.deepEqual(doc.heading.blob!.group(0).headers.map(utf8), ['name', 'offset', 'length'])
+    assert.throws(() => new Document(g('␖␁k␟␅g␄')), C0SyntaxError)
   })
 
-  it('accesses groups by name', () => {
-    const data = buf(FS, 'db', GS, 'users', SOH, 'name', RS, 'Alice', GS, 'config', RS, 'k', US, 'v')
-    const doc = new Document(data)
-    const group = doc.group('users')
-    assert.equal(dec.decode(group.name), 'users')
+  it('a container holds several documents and the EM tail', () => {
+    const cont = new Container(concat([g('␖␁blob␟␐␁␞name␟offset␟length␞lamp␟0␟3␞desk␟3␟4␘␄␖␜catalogue␝items␁␞name␟photo␞Lamp␟lamp␄'), buf(EM, 'abcdefg')]))
+    assert.equal(cont.documents.length, 2)
+    assert.equal(cont.hasEm, true)
+    assert.equal(utf8(cont.tail), 'abcdefg')
+    assert.equal(utf8(cont.blob('lamp')!), 'abc')
+    assert.equal(utf8(cont.blob('desk')!), 'defg')
+    assert.equal(cont.blob('nope'), undefined)
+    assert.equal(utf8(cont.documents[1].name), 'catalogue')
   })
 
-  it('accesses groups by index', () => {
-    const data = buf(FS, 'db', GS, 'users', RS, 'Alice', GS, 'config', RS, 'k')
-    const doc = new Document(data)
-    assert.equal(dec.decode(doc.group(0).name), 'users')
-    assert.equal(dec.decode(doc.group(1).name), 'config')
+  it('a second document needs SYN; bytes after EOT are an error', () => {
+    assert.throws(() => new Container(g('␞a␄␞b')), C0SyntaxError)
+    assert.throws(() => new Container(g('␞a␄x')), C0SyntaxError)
+    assert.equal(new Container(g('␞a␄␖␞b␄')).documents.length, 2)
+  })
+})
+
+// ============================================================
+// Validator
+// ============================================================
+
+describe('validate / canonical', () => {
+  it('accepts the spec examples', () => {
+    for (const s of [
+      '␖␜mydb␝users␁␞name␟amount␞Alice␟100␞Bob␟200␄',
+      '␖␁shape␟stream␞alice␟100␗␞bob␟200␗',
+      '␖␁shape␟diff␜foo.txt␝␂Hello ␃␟world␚universe␄',
+      '␝database␞␁host␟localhost␁port␟5432␝server␞␁host␟0.0.0.0␁allowed_origins␟␐␞localhost␟example.com␘',
+      '␇ note␇␞dead␇␝g␇␁␞h␞Alice␟␇␐␞Admin␘␟100',
+    ]) validate(g(s))
   })
 
-  it('raises on unknown group name', () => {
-    const data = buf(FS, 'db', GS, 'users', RS, 'Alice')
-    const doc = new Document(data)
-    assert.throws(() => doc.group('nope'), /No group named/)
+  it('rejects malformed input', () => {
+    for (const bytes of [
+      buf(RS, 0x0e),                         // unassigned code
+      buf(RS, STX, 'a'),                     // unclosed text
+      buf(RS, STX, DLE, 'a', ETX),           // DLE before a non-escapable byte
+      buf(RS, 'a\nb'),                       // LF inside a plain value
+      buf(RS, SOH, 'a', US, '1', US, '2'),   // mixed record
+      buf(RS, SOH, 'a'),                     // key without a value
+      buf(GS, STX, 'name', ETX),             // a name as text
+      buf(RS, 'a', SUB, 'b'),                // SUB outside a diff
+      buf(RS, 'a', EOT, 'b'),                // bytes after EOT
+      buf(RS, 'a', BEL, US, 'b'),            // BEL before a non-element
+      buf(RS, DLE, 'x', CAN),                // DLE before plain
+      buf(RS, DLE, RS, 'x'),                 // level not closed
+      buf(RS, 'x', CAN),                     // unmatched CAN
+      buf(RS, 'a', RS, 'b', SOH, RS, 'h'),   // header row not first
+      buf(SYN, 'x'),                         // plain directly after SYN
+    ]) assert.throws(() => validate(bytes), C0Error, toHex(bytes))
   })
 
-  it('handles document without FS', () => {
-    const data = buf(GS, 'users', RS, 'Alice')
-    const doc = new Document(data)
-    assert.equal(dec.decode(doc.name), '')
-    assert.equal(doc.groupCount, 1)
-  })
-
-  it('handles document with EOT', () => {
-    const data = buf(FS, 'db', GS, 'users', RS, 'Alice', EOT)
-    const doc = new Document(data)
-    assert.equal(doc.groupCount, 1)
-  })
-
-  it('ignores deeper GS×N sections', () => {
-    const data = buf(GS, 'doc', RS, 'intro', GS, GS, 'chapter1', RS, 'content', GS, 'other')
-    const doc = new Document(data)
-    // Should find 'doc' and 'other' as top-level, skip GS×2 'chapter1'
-    assert.equal(doc.groupCount, 2)
-    assert.equal(dec.decode(doc.group(0).name), 'doc')
-    assert.equal(dec.decode(doc.group(1).name), 'other')
-  })
-
-  it('iterates groups', () => {
-    const data = buf(FS, 'db', GS, 'a', RS, '1', GS, 'b', RS, '2')
-    const doc = new Document(data)
-    const names: string[] = []
-    doc.eachGroup(g => names.push(dec.decode(g.name)))
-    assert.deepEqual(names, ['a', 'b'])
+  it('classifies canonical form', () => {
+    assert.equal(canonical(g('␝g␞a␟b')), true)
+    assert.equal(canonical(buf(GS, 'g', RS, 'a', US, ' b')), false) // layout
+    assert.equal(canonical(g('␝g␞␂a␃')), false)         // gratuitous text
+    assert.equal(canonical(g('␝g␞␂␃')), false)           // empty text
+    assert.equal(canonical(g('␖␝g␞a␄')), false)         // framing
+    assert.equal(canonical(g('␝g␇n␞a')), false)          // comment
+    assert.equal(canonical(g('␞␁a␟1␁a␟2')), false)       // duplicate key
+    assert.equal(canonical(g('␞␁a␟1␁b␟2␁a␟3')), false)   // duplicate key, not adjacent
+    assert.equal(canonical(g('␞␁b␟1␁a␟2')), true)        // key order is data
+    assert.equal(canonical(g('␞␅␂g␃')), false)           // group reference as text
+    assert.equal(canonical(buf(RS, 0x0e)), false)        // not even well-formed
   })
 })
 
 // ============================================================
 // Pretty
 // ============================================================
+
 describe('Pretty', () => {
-  it('maps control codes to correct glyphs', () => {
-    assert.equal(glyph(SOH), '␁')
-    assert.equal(glyph(STX), '␂')
-    assert.equal(glyph(ETX), '␃')
-    assert.equal(glyph(EOT), '␄')
-    assert.equal(glyph(ENQ), '␅')
-    assert.equal(glyph(DLE), '␐')
-    assert.equal(glyph(SUB), '␚')
-    assert.equal(glyph(FS), '␜')
-    assert.equal(glyph(GS), '␝')
+  it('maps codes to Control Pictures', () => {
     assert.equal(glyph(RS), '␞')
-    assert.equal(glyph(US), '␟')
+    assert.equal(glyph(DLE), '␐')
+    assert.equal(glyph(CAN), '␘')
+    assert.equal(glyph(SYN), '␖')
   })
 
-  it('formats a simple table', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30')
-    const pretty = format(data)
-    assert.ok(pretty.includes('␝users'))
-    assert.ok(pretty.includes('␁name␟age'))
-    assert.ok(pretty.includes('␞Alice␟30'))
+  it('formats a document one element per line', () => {
+    const out = format(g('␖␜mydb␝users␁␞name␟amount␞Alice Smith␟1502.30␞Bob␟340.00␄'))
+    assert.equal(out, '␖\n␜mydb\n␝users\n  ␁␞name␟amount\n  ␞Alice Smith␟1502.30\n  ␞Bob␟340.00\n␄\n')
+  })
+
+  it('shows the heading on the SYN line and text exactly', () => {
+    const out = format(g('␖␁shape␟stream␁blob␟␐␁␞name␟offset␘␞note␟␂line one\nline two␃␗'))
+    assert.equal(out, '␖␁shape␟stream␁blob␟␐␁␞name␟offset␘\n␞note␟␂line one\nline two␃␗\n')
+  })
+
+  it('breaks the line at a level and resumes after CAN', () => {
+    const out = format(g('␝users␁␞name␟address␞Alice␟␐␁␞street␟city␞123 Main␟Springfield␘␞Bob␟␐␘'))
+    assert.equal(out, [
+      '␝users',
+      '  ␁␞name␟address',
+      '  ␞Alice␟␐',
+      '    ␁␞street␟city',
+      '    ␞123 Main␟Springfield',
+      '  ␘',
+      '  ␞Bob␟␐',
+      '  ␘',
+      '',
+    ].join('\n'))
   })
 
   it('round-trips through format and parse', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30')
-    const pretty = format(data)
-    const compact = parse(pretty)
-    assert.deepEqual(compact, data)
+    for (const s of [
+      '␖␜mydb␝users␁␞name␟amount␞Alice Smith␟1502.30␞Bob␟340.00␄',
+      '␝k␞␁host␟localhost␁port␟5432␞␁list␟␐␞a␟b␘',
+      '␞a␟␂ spaced \ttab ␐␗␃␟␅␂g␟r␃␗payload',
+      '␇ a note␇␞dead␟x␞live',
+      '␖␁shape␟diff␜foo.txt␝␂Hello ␃␟world␚universe␟!␞count␚total␄',
+      '␖␁blob␟␐␁␞name␟offset␘␄␙raw bytes',
+    ]) {
+      const bytes = g(s)
+      assert.deepEqual(parse(format(bytes)), bytes, s)
+    }
   })
 
-  it('preserves whitespace inside STX/ETX', () => {
-    const data = buf(GS, 'test', RS, STX, ' hello  world ', ETX)
-    const pretty = format(data)
-    const compact = parse(pretty)
-    assert.deepEqual(compact, data)
+  it('parse drops layout touching a glyph and keeps interior spaces', () => {
+    assert.deepEqual(parse('  ␝ users \n  ␞ Alice Smith ␟ 100 \n'), g('␝users␞Alice Smith␟100'))
+    assert.deepEqual(parse('␞␂ kept \n␃'), buf(RS, STX, ' kept \n', ETX))
   })
 
-  it('preserves spaces between words', () => {
-    const data = buf(GS, 'test', RS, 'hello world')
-    const pretty = format(data)
-    const compact = parse(pretty)
-    assert.deepEqual(compact, data)
+  it('refuses a value holding a Control Picture', () => {
+    assert.throws(() => format(buf(RS, '␞')), GlyphInDataError)
   })
 
-  it('formats with spaced mode — columns aligned with spaces', () => {
-    const data = buf(
-      GS, 'users', SOH, 'name', US, 'age',
-      RS, 'Alice', US, '30',
-      RS, 'Bob', US, '25',
-    )
-    const pretty = format(data, { mode: 'spaced' })
-    // Spaced: prefix + space, fields padded, space around ␟
-    assert.ok(pretty.includes('␁ name  ␟ age'))
-    assert.ok(pretty.includes('␞ Alice ␟ 30'))
-    assert.ok(pretty.includes('␞ Bob   ␟ 25'))
+  it('aligns table columns and keyed records', () => {
+    const bytes = g('␝users␁␞name␟amount␞Alice Smith␟1502.30␞Bob␟340.00')
+    assert.equal(format(bytes, { mode: 'aligned' }),
+      '␝users\n  ␁␞name       ␟amount\n  ␞Alice Smith␟1502.30\n  ␞Bob        ␟340.00\n')
+    assert.equal(format(bytes, { mode: 'spaced' }),
+      '␝ users\n  ␁␞ name        ␟ amount\n  ␞ Alice Smith ␟ 1502.30\n  ␞ Bob         ␟ 340.00\n')
+    const keyed = format(g('␝db␞␁host␟localhost␁port␟5432␞␁hostname␟x␁p␟1'), { mode: 'aligned' })
+    assert.equal(keyed, '␝db\n  ␞␁host    ␟localhost ␁port␟5432\n  ␞␁hostname␟x         ␁p   ␟1\n')
+    assert.deepEqual(parse(keyed), g('␝db␞␁host␟localhost␁port␟5432␞␁hostname␟x␁p␟1'))
+    assert.deepEqual(parse(align(format(bytes), 'spaced')), bytes)
+  })
+})
+
+// ============================================================
+// Tokenizer
+// ============================================================
+
+describe('Tokenizer', () => {
+  it('emits one token per code, whole texts, and plain/layout runs', () => {
+    const tokens = tokenize(buf(RS, 'Alice ', US, STX, 'a', DLE, ETX, ETX, '\n', SYN, EM, 'raw'))
+    assert.deepEqual(tokens.map(t => t.type), [
+      TokenType.RS, TokenType.Data, TokenType.Layout, TokenType.US, TokenType.Text, TokenType.Layout, TokenType.SYN, TokenType.EM,
+    ])
+    assert.deepEqual(tokens[1], { type: TokenType.Data, start: 1, end: 6 })
   })
 
-  it('formats with aligned mode — columns aligned without extra spaces', () => {
-    const data = buf(
-      GS, 'users', SOH, 'name', US, 'age',
-      RS, 'Alice', US, '30',
-      RS, 'Bob', US, '25',
-    )
-    const pretty = format(data, { mode: 'aligned' })
-    // Aligned: no space after prefix, no space around ␟
-    assert.ok(pretty.includes('␁name ␟age'))
-    assert.ok(pretty.includes('␞Alice␟30'))
-    assert.ok(pretty.includes('␞Bob  ␟25'))
-  })
-
-  it('formats with compact mode — no padding', () => {
-    const data = buf(
-      GS, 'users', SOH, 'name', US, 'age',
-      RS, 'Alice', US, '30',
-    )
-    const pretty = format(data, { mode: 'compact' })
-    assert.ok(pretty.includes('␁name␟age'))
-    assert.ok(pretty.includes('␞Alice␟30'))
-  })
-
-  it('align round-trips through parse', () => {
-    const data = buf(
-      GS, 'users', SOH, 'name', US, 'age',
-      RS, 'Alice', US, '30',
-      RS, 'Bob', US, '25',
-    )
-    const spaced = format(data, { mode: 'spaced' })
-    const compact = parse(spaced)
-    assert.deepEqual(compact, data)
-  })
-
-  it('align handles mixed table and non-table lines', () => {
-    const data = buf(
-      FS, 'mydb',
-      GS, 'users', SOH, 'name', US, 'age',
-      RS, 'Alice', US, '30',
-      GS, 'config', RS, 'host', US, 'localhost',
-    )
-    const spaced = format(data, { mode: 'spaced' })
-    // FS line should have space after glyph
-    assert.ok(spaced.includes('␜ mydb'))
-    // GS line should have space after glyph
-    assert.ok(spaced.includes('␝ users'))
-    // Table should be aligned
-    assert.ok(spaced.includes('␞ Alice ␟ 30'))
-  })
-
-  it('align standalone function works on pretty strings', () => {
-    const pretty = '␝users\n  ␁name␟age\n  ␞Alice␟30\n  ␞Bob␟25\n'
-    const spaced = align(pretty, 'spaced')
-    assert.ok(spaced.includes('␁ name  ␟ age'))
-    assert.ok(spaced.includes('␞ Alice ␟ 30'))
-    assert.ok(spaced.includes('␞ Bob   ␟ 25'))
+  it('rejects unassigned codes', () => {
+    assert.throws(() => tokenize(buf(RS, 0x0e)), C0Error)
   })
 })
 
 // ============================================================
 // CSV
 // ============================================================
+
 describe('CSV', () => {
-  it('converts CSV to C0DATA', () => {
-    const csv = 'name,age\nAlice,30\nBob,25\n'
-    const data = fromCSV(csv, 'users')
-    const table = new Table(data)
-    assert.equal(dec.decode(table.name), 'users')
-    assert.equal(table.headerCount, 2)
-    assert.equal(table.recordCount, 2)
-    assert.equal(dec.decode(table.record(0).field(0)), 'Alice')
+  it('parses quoted fields and CRLF', () => {
+    assert.deepEqual(parseCSV('a,b\r\n"x, y","say ""hi"""\n'), [['a', 'b'], ['x, y', 'say "hi"']])
+    assert.deepEqual(parseCSV(''), [])
   })
 
-  it('converts C0DATA to CSV', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30', RS, 'Bob', US, '25')
-    const csv = toCSV(data)
-    assert.ok(csv.includes('name,age'))
-    assert.ok(csv.includes('Alice,30'))
-    assert.ok(csv.includes('Bob,25'))
+  it('converts both ways with a header row', () => {
+    const bytes = fromCSV('name,amount\nAlice Smith,1502.30\nBob,340.00\n', 'users')
+    assert.deepEqual(bytes, g('␝users␁␞name␟amount␞Alice Smith␟1502.30␞Bob␟340.00'))
+    assert.equal(toCSV(bytes), 'name,amount\nAlice Smith,1502.30\nBob,340.00\n')
   })
 
-  it('handles empty CSV', () => {
-    const data = fromCSV('')
-    assert.equal(data.length, 0)
-  })
-
-  it('handles quoted CSV fields', () => {
-    const csv = 'name,note\nAlice,"has, comma"\n'
-    const data = fromCSV(csv)
-    const table = new Table(data)
-    assert.equal(dec.decode(table.record(0).field(1)), 'has, comma')
-  })
-
-  it('round-trips CSV', () => {
-    const csv = 'name,age\nAlice,30\nBob,25\n'
-    const data = fromCSV(csv)
-    const result = toCSV(data)
-    assert.equal(result, csv)
+  it('writes references as paths and refuses levels', () => {
+    assert.equal(toCSV(g('␝g␞a␟␅␂tags␟001␃')), 'a,tags/001\n')
+    assert.throws(() => toCSV(g('␝g␞a␟␐␞x␘')), C0Error)
+    assert.equal(toCSV(g('␝a␞1␝b␞2'), 'b'), '2\n')
   })
 })
 
 // ============================================================
 // JSON
 // ============================================================
+
 describe('JSON', () => {
-  it('exports tabular group as array of objects', () => {
-    const data = buf(GS, 'users', SOH, 'name', US, 'age', RS, 'Alice', US, '30')
-    const obj = toObject(data) as { [key: string]: unknown }
-    const users = (obj as any).users as any[]
-    assert.equal(users.length, 1)
-    assert.equal(users[0].name, 'Alice')
-    assert.equal(users[0].age, '30')
+  it('exports a table with a header row as objects, a map as an object', () => {
+    assert.deepEqual(toObject(g('␝users␁␞name␟amount␞Alice␟100␝db␞␁host␟x␁port␟1')), {
+      users: [{ name: 'Alice', amount: '100' }],
+      db: { host: 'x', port: '1' },
+    })
+    assert.deepEqual(toObject(g('␞a␟␐␞1␟2␘␟␅␂g␟r␃')), [['a', ['1', '2'], { $ref: 'g/r' }]])
+    assert.deepEqual(toObject(g('␜db␝g␞a')), { db: { g: [['a']] } })
   })
 
-  it('exports key-value group as flat object', () => {
-    const data = buf(GS, 'config', RS, 'host', US, 'localhost', RS, 'port', US, '8080')
-    const obj = toObject(data) as any
-    assert.equal(obj.config.host, 'localhost')
-    assert.equal(obj.config.port, '8080')
+  it('imports objects of groups, arrays of objects, and nested values', () => {
+    assert.deepEqual(fromObject({ users: [{ name: 'Alice', tags: ['a', 'b'] }], db: { host: 'x', n: 1, z: null } }),
+      g('␝users␁␞name␟tags␞Alice␟␐␞a␟b␘␝db␞␁host␟x␁n␟1␁z␟'))
+    assert.deepEqual(fromObject({ mydb: { users: [['a', 'b']] } }), g('␜mydb␝users␞a␟b'))
+    assert.deepEqual(fromObject({ a: 'x' }), g('␝data␞␁a␟x'))
+    assert.deepEqual(fromObject(['x', 'y'], 'items'), g('␝items␞x␞y'))
+    assert.deepEqual(fromJSON('{"k":{"a":"1"}}'), g('␝k␞␁a␟1'))
   })
 
-  it('imports flat key-value from JSON', () => {
-    const json = '{"host":"localhost","port":"8080"}'
-    const data = fromJSON(json, 'config')
-    const table = new Table(data)
-    assert.equal(dec.decode(table.name), 'config')
-    assert.equal(table.recordCount, 2)
-  })
-
-  it('imports array of objects from JSON', () => {
-    const json = '[{"name":"Alice","age":"30"},{"name":"Bob","age":"25"}]'
-    const data = fromJSON(json, 'users')
-    const table = new Table(data)
-    assert.equal(table.headerCount, 2)
-    assert.equal(table.recordCount, 2)
-  })
-
-  it('imports nested objects with STX/ETX', () => {
-    const json = '{"user":{"name":"Alice","address":{"city":"NYC"}}}'
-    const data = fromJSON(json)
-    // Verify it has nested structure
-    const tokens = tokenize(data)
-    const hasSTX = tokens.some(t => t.type === TokenType.STX)
-    assert.ok(hasSTX)
-  })
-
-  it('round-trips JSON for flat tables', () => {
-    const json = '[{"name":"Alice","age":"30"},{"name":"Bob","age":"25"}]'
-    const data = fromJSON(json, 'users')
-    const result = toObject(data) as any
-    assert.deepEqual(result.users, JSON.parse(json))
-  })
-
-  it('round-trips JSON for key-value', () => {
-    const json = '{"host":"localhost","port":"8080"}'
-    const data = fromJSON(json, 'config')
-    const result = toObject(data) as any
-    assert.deepEqual(result.config, JSON.parse(json))
+  it('round-trips tables and maps', () => {
+    const table = g('␝users␁␞name␟amount␞Alice␟100␞Bob␟200')
+    assert.deepEqual(fromJSON(toJSON(table), 'x'), table)
+    const map = g('␝db␞␁host␟x␁port␟1')
+    assert.deepEqual(fromJSON(toJSON(map)), map)
   })
 })
 
 // ============================================================
 // Diff
 // ============================================================
+
 describe('Diff', () => {
-  it('parses a simple diff', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('test.txt', () => {
-        b.replace('before ', 'old', 'new', ' after')
+  it('builds a diff document', () => {
+    const diff = buildDiff(d => {
+      d.file('greeting.txt', () => d.section(s => s.anchor('Hello ').sub('world', 'universe').anchor('!')))
+      d.file('tally.rb', () => {
+        d.section(s => s.anchor('def tally(items)'))
+        d.replaceAll('count', 'total')
+        d.section(s => s.anchor('end'))
       })
+      d.eot()
     })
-    const edits = parseDiff(diffBuf)
-    assert.equal(edits.length, 1)
-    assert.equal(dec.decode(edits[0].path), 'test.txt')
-    assert.equal(edits[0].sections.length, 1)
+    assert.deepEqual(diff, g('␖␁shape␟diff␜greeting.txt␝␂Hello ␃␟world␚universe␟!␜tally.rb␝def tally(items)␞count␚total␝end␄'))
+    const edits = parseDiff(diff)
+    assert.equal(edits.length, 2)
+    assert.equal(utf8(edits[0].sections[0].search), 'Hello world!')
+    assert.equal(utf8(edits[0].sections[0].replacement), 'Hello universe!')
+    assert.equal(edits[1].sections[0].replaces.length, 1)
   })
 
-  it('applies a simple substitution', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('test.txt', () => {
-        b.replace('', 'hello', 'world')
-      })
+  it('applies atomically and leaves other files alone', () => {
+    const diff = buildDiff(d => {
+      d.file('a.txt').replace('Hello ', 'world', 'universe', '!')
+      d.file('b.txt').section(s => s.sub('x', 'y'))
     })
-    const result = applyDiff(diffBuf, { 'test.txt': 'say hello here' })
-    assert.equal(result.get('test.txt'), 'say world here')
+    const out = applyDiff(diff, { 'a.txt': 'Hello world!', 'b.txt': 'axb', 'c.txt': 'untouched' })
+    assert.deepEqual(Object.fromEntries(out), { 'a.txt': 'Hello universe!', 'b.txt': 'ayb', 'c.txt': 'untouched' })
+    assert.throws(() => applyDiff(diff, { 'a.txt': 'Hello world!' }), C0Error) // b.txt missing
+    assert.throws(() => applyDiff(diff, { 'a.txt': 'Hello world! Hello world!', 'b.txt': 'axb' }), C0Error)
   })
 
-  it('applies multi-file edits', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('a.txt', () => {
-        b.replace('', 'foo', 'bar')
-      })
-      b.file('b.txt', () => {
-        b.replace('', 'baz', 'qux')
-      })
-    })
-    const result = applyDiff(diffBuf, { 'a.txt': 'foo', 'b.txt': 'baz' })
-    assert.equal(result.get('a.txt'), 'bar')
-    assert.equal(result.get('b.txt'), 'qux')
-  })
-
-  it('preserves unmodified files', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('a.txt', () => {
-        b.replace('', 'old', 'new')
-      })
-    })
-    const result = applyDiff(diffBuf, { 'a.txt': 'old', 'b.txt': 'unchanged' })
-    assert.equal(result.get('b.txt'), 'unchanged')
-  })
-
-  it('raises on missing file', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('missing.txt', () => {
-        b.replace('', 'x', 'y')
-      })
-    })
-    assert.throws(() => applyDiff(diffBuf, {}), /File not found/)
-  })
-
-  it('raises on missing pattern', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('test.txt', () => {
-        b.replace('', 'nothere', 'something')
-      })
-    })
-    assert.throws(() => applyDiff(diffBuf, { 'test.txt': 'hello' }), /Pattern not found/)
-  })
-
-  it('raises on ambiguous pattern', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('test.txt', () => {
-        b.replace('', 'aa', 'bb')
-      })
-    })
-    assert.throws(() => applyDiff(diffBuf, { 'test.txt': 'aa aa' }), /found 2 times/)
-  })
-
-  it('uses section builder with anchors', () => {
-    const diffBuf = buildDiff(b => {
-      b.file('test.txt', () => {
-        b.section(sb => {
-          sb.anchor('function ')
-          sb.sub('oldName', 'newName')
-          sb.anchor('()')
-        })
-      })
-    })
-    const result = applyDiff(diffBuf, { 'test.txt': 'function oldName() {}' })
-    assert.equal(result.get('test.txt'), 'function newName() {}')
+  it('refuses a contradicting shape', () => {
+    assert.throws(() => parseDiff(g('␖␁shape␟stream␜a␝x')), C0Error)
+    assert.equal(parseDiff(g('␜a␝x')).length, 1)
   })
 })
 
-// ============================================================
-// List fields (Builder#listField / Record#list)
-// ============================================================
-
-describe('List fields', () => {
-  it('listField writes a US-separated list inside STX/ETX as one field', () => {
-    const out = build(b => {
-      b.group('users', null, () => {
-        b.record('Alice')
-        b.listField(['Admin', 'Editor', 'User'])
-        b.field('1502.30')
-      })
-    })
-    assert.deepEqual(out, buf(
-      GS, 'users',
-      RS, 'Alice',
-      US, STX, 'Admin', US, 'Editor', US, 'User', ETX,
-      US, '1502.30',
-    ))
-    const rec = new Table(out).record(0)
-    assert.equal(rec.fieldCount, 3)
-    assert.equal(dec.decode(rec.value(0)), 'Alice')
-    assert.deepEqual(rec.list(1).map(i => dec.decode(i)), ['Admin', 'Editor', 'User'])
-    assert.equal(dec.decode(rec.value(2)), '1502.30')
-  })
-
-  it('round-trips escaped items and empty lists through Record#list', () => {
-    const items = ['a\u001Fb', '', 'c\u0002d', 'plain']
-    const out = build(b => {
-      b.group('t', null, () => {
-        b.record('x')
-        b.listField(items)
-        b.listField([])
-      })
-    })
-    const rec = new Table(out).record(0)
-    assert.equal(rec.fieldCount, 3)
-    assert.deepEqual(rec.list(1).map(i => dec.decode(i)), items)
-    assert.deepEqual(rec.list(2), [])
-  })
-
-  it('Record#list unescapes items and keeps nested scopes intact', () => {
-    const b = buf(
-      GS, 't',
-      RS, STX, 'Ed', DLE, US, 'itor', US, STX, 'x', US, 'y', ETX, US, 'b', ETX,
-    )
-    const items = new Table(b).record(0).list(0)
-    assert.equal(items.length, 3)
-    assert.equal(dec.decode(items[0]), 'Ed\u001Fitor')
-    assert.equal(items[1][0], STX)
-    assert.equal(dec.decode(items[2]), 'b')
-  })
-
-  it('Record#list returns a plain field as a single item and an empty scope as empty', () => {
-    const b = buf(GS, 't', RS, 'plain', US, STX, ETX)
-    const rec = new Table(b).record(0)
-    assert.deepEqual(rec.list(0).map(i => dec.decode(i)), ['plain'])
-    assert.deepEqual(rec.list(1), [])
-  })
-})
-
-describe('Reference name guard', () => {
-  it('rejects control bytes in reference names and path segments', () => {
-    assert.throws(() => new Builder().ref('bad\u001Fname'), /control bytes/)
-    assert.throws(() => new Builder().ref('users', '01\u001E', 'name'), /control bytes/)
-    const out = build(b => { b.ref('users'); b.ref('users', '01', 'name') })
-    assert.deepEqual(out, buf(ENQ, 'users', ENQ, STX, 'users', US, '01', US, 'name', ETX))
-  })
-})
+// keep the Record import used for typing
+void (null as unknown as C0Record)
+void Builder
