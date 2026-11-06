@@ -11,7 +11,7 @@ import { SOH, STX, ENQ, BEL, DLE, ETB, FS, GS, RS, US, isLayout } from './consta
 import { C0Error, C0SyntaxError, KeyError } from './error.js'
 import {
   scanLayout, scanText, scanLevel, scanPlain, scanUnit, scanComment, scanRecordEnd,
-  trim, value as logicalValue, decodeText,
+  trim, value as logicalValue, decodeText, isPlain,
 } from './core.js'
 import { EMPTY, bytesEqual, encoder, utf8 } from './bytes.js'
 
@@ -534,6 +534,7 @@ export class Reference {
       segs.push(inside.subarray(s))
       if (segs.length > 3) throw new C0SyntaxError('reference path with more than three segments', p)
       if (segs.some(x => x.length === 0)) throw new C0SyntaxError('reference path with an empty segment', p)
+      if (segs.some(x => !isPlain(x))) throw new C0SyntaxError('reference path segment is not a name', p)
       return new Reference(segs)
     }
     const name = trim(t.subarray(p))

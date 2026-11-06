@@ -176,7 +176,7 @@ export class StreamReader {
     return p
   }
 
-  // Is the tail more than layout, notes and EOT?
+  // Is the tail more than layout, notes, EOT and an EM region?
   private tornTail(): boolean {
     const buf = this.buf
     const len = buf.length
@@ -187,6 +187,8 @@ export class StreamReader {
       const b = buf[pos]
       if (b === EOT) {
         pos++
+      } else if (b === EM) {
+        return false // the raw region is not log data
       } else if (b === BEL) {
         const p2 = scanLayout(buf, pos + 1, len)
         if (p2 < len && buf[p2] < 0x20 && buf[p2] !== STX) return true // a dead element is data

@@ -443,6 +443,7 @@ export class Validator {
         const inside = decodeText(buf.subarray(start + 1, pos - 1))
         const segs = inside.length === 0 ? [] : splitUS(inside)
         if (segs.some(s => s.length === 0)) throw new C0SyntaxError('reference path with an empty segment', start)
+        if (segs.some(s => !isPlain(s))) throw new C0SyntaxError('reference path segment is not a name', start)
         if (segs.length > 3) throw new C0SyntaxError('reference path with more than three segments', start)
         if (segs.length === 1) this.notCanonical('group reference written as text')
       } else {
