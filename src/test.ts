@@ -175,6 +175,8 @@ describe('Builder', () => {
     assert.deepEqual(build(b => b.bel().gs('old').rs('1').gs('new').rs('2')), g('␇␝old␞1␝new␞2'))
     assert.deepEqual(build(b => b.gs().gs('sub').rs().enq('users').us().enq('users', '1')), g('␝␝sub␞␅users␟␅␂users␟1␃'))
     assert.deepEqual(build(b => b.syn().soh('version').us('1').rs('a').eot()), g('␖␁version␟1␞a␄'))
+    assert.deepEqual(build(b => b.fs('f').rs('old').sub('new').gs('x').us('10').sub('20')), g('␜f␞old␚new␝x␟10␚20'))
+    assert.deepEqual(build(b => b.rs('old').sub(' new ').sub()), buf(RS, 'old', SUB, STX, ' new ', ETX, SUB))
     assert.deepEqual(build(b => b.rs(' a ').us(' b ').bel(' n ').etb('c1')), buf(RS, STX, ' a ', ETX, US, STX, ' b ', ETX, BEL, STX, ' n ', ETX, ETB, 'c1'))
   })
 

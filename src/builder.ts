@@ -11,7 +11,7 @@
  *   })
  *
  * Two layers. The primitives are one method per code (`fs`, `gs`, `rs`,
- * `us`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`); each
+ * `us`, `sub`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`); each
  * writes its code and, when given, what grammatically follows it, so a chain
  * reads like the bytes:
  *
@@ -29,7 +29,7 @@
  * otherwise. Keyed records keep the order given. Nested levels open with DLE
  * and close with CAN.
  */
-import { SOH, STX, ETX, EOT, ENQ, BEL, DLE, SYN, ETB, CAN, EM, FS, GS, RS, US } from './constants.js'
+import { SOH, STX, ETX, EOT, ENQ, BEL, DLE, SYN, ETB, CAN, EM, SUB, FS, GS, RS, US } from './constants.js'
 import { C0Error } from './error.js'
 import { writeValue, writeName, isName } from './core.js'
 import { ByteWriter, toBytes, utf8, type ByteSource } from './bytes.js'
@@ -99,6 +99,17 @@ export class Builder {
     this.io.push(US)
     if (value !== undefined) writeValue(this.io, value)
     this.units++
+    return this
+  }
+
+  /**
+   * SUB and, when given, the new side of a substitution. C0-DIFF only:
+   * `rs('old').sub('new')` is a replace-all; in a data body SUB is an error.
+   * Does not change the unit count.
+   */
+  sub(value?: BuilderValue): this {
+    this.io.push(SUB)
+    if (value !== undefined) writeValue(this.io, value)
     return this
   }
 

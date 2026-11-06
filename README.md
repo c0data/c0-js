@@ -81,7 +81,8 @@ line break, or any control byte. Names (file and group labels, keys, header
 names) must be identifiers.
 
 Underneath, the builder has one method per code: `fs`, `gs`, `rs`, `us`,
-`soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
+`sub` (C0-DIFF only), `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`,
+`etb`, `em`. Each writes
 its code and, when given, what follows it, so a chain reads like the
 bytes, and anything the grammar allows can be written:
 
@@ -92,6 +93,7 @@ b.gs('users').soh().rs('name').us('amount')                  // header row
 b.rs('cfg').us().dle().rs().soh('b').us('2').can()           // ␞cfg␟␐␞␁b␟2␘
 b.bel().gs('old')                                            // a dead group
 b.gs().gs('sub').rs().enq('users').us().enq('users', '1')    // ␝␝sub␞␅users␟␅␂users␟1␃
+b.rs('old').sub('new')                                       // ␞old␚new  (C0-DIFF replace-all)
 ```
 
 The composed methods above are built on these and cannot write ill-formed
