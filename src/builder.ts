@@ -10,13 +10,28 @@
  *     b.eot()
  *   })
  *
+ * Two layers. The primitives are one method per code (`fs`, `gs`, `rs`,
+ * `us`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`); each
+ * writes its code and, when given, what grammatically follows it, so a chain
+ * reads like the bytes:
+ *
+ *   b.rs('Alice').us('1502.30')                        // ␞Alice␟1502.30
+ *   b.rs().soh('host').us('localhost').soh('port').us('5432')
+ *   b.bel().gs('old')                                  // a dead group
+ *
+ * The composed methods (`file`, `group`, `header`, `record`, `field`, `map`,
+ * `key`, `level`, `list`, `ref`, `note`) are built on the primitives and
+ * cannot write ill-formed output. The primitives write what you spell;
+ * well-formedness is then yours to keep. Both layers share the record state,
+ * so they mix.
+ *
  * Values are written in their one spelling: plain when they can be, text
- * otherwise. Keyed records (`map`) keep the order given. Nested levels
- * (`level`, `list`, `key` with a function) open with DLE and close with CAN.
+ * otherwise. Keyed records keep the order given. Nested levels open with DLE
+ * and close with CAN.
  */
 import { SOH, STX, ETX, EOT, ENQ, BEL, DLE, SYN, ETB, CAN, EM, FS, GS, RS, US } from './constants.js'
 import { C0Error } from './error.js'
-import { writeValue, writeName, isName, isPlain } from './core.js'
+import { writeValue, writeName, isName } from './core.js'
 import { ByteWriter, toBytes, utf8, type ByteSource } from './bytes.js'
 
 export type BuilderValue = ByteSource
@@ -29,6 +44,8 @@ export function pairEntries(pairs: Pairs): [string, BuilderValue][] {
   if (Array.isArray(pairs)) return pairs
   return Object.entries(pairs)
 }
+
+const EMPTY_NOTE = 'a note needs content: bare BEL marks the next element dead'
 
 export class Builder {
   private readonly io = new ByteWriter()
@@ -50,37 +67,118 @@ export class Builder {
     return utf8(this.toUint8Array())
   }
 
-  // ---- documents -------------------------------------------------------
+  // ---- primitives: one method per code ---------------------------------
 
-  /** SYN and a heading. Keys in the order given; values written as values. */
-  syn(pairs: Pairs = {}): this {
+  /** FS and a file name. */
+  fs(name: string): this {
     this.endRecord()
-    this.io.push(SYN)
-    for (const [k, v] of pairEntries(pairs)) {
-      this.io.push(SOH)
-      writeName(this.io, k)
-      this.io.push(US)
-      writeValue(this.io, v)
+    this.io.push(FS)
+    writeName(this.io, name)
+    return this
+  }
+
+  /** GS and, when given, a group name. `gs().gs('sub')` is a group at depth 2. */
+  gs(name?: string): this {
+    this.endRecord()
+    this.io.push(GS)
+    if (name !== undefined) writeName(this.io, name)
+    return this
+  }
+
+  /** RS and, when given, the record's first value. */
+  rs(value?: BuilderValue): this {
+    this.io.push(RS)
+    this.inRecord = true
+    this.units = 0
+    if (value !== undefined) this.firstValue(value)
+    return this
+  }
+
+  /** US and, when given, the value that follows it. */
+  us(value?: BuilderValue): this {
+    this.io.push(US)
+    if (value !== undefined) writeValue(this.io, value)
+    this.units++
+    return this
+  }
+
+  /** SOH and, when given, a key. Bare before `rs` it opens a header row. */
+  soh(name?: string): this {
+    this.io.push(SOH)
+    if (name !== undefined) writeName(this.io, name)
+    return this
+  }
+
+  /** DLE: open a nested level. Inside, the builder is at the top of a fresh body. */
+  dle(): this {
+    this.stack.push([this.inRecord, this.units])
+    this.inRecord = false
+    this.units = 0
+    this.io.push(DLE)
+    return this
+  }
+
+  /** CAN: close the innermost level. */
+  can(): this {
+    const st = this.stack.pop()
+    if (st === undefined) throw new C0Error('CAN with no open level')
+    this.io.push(CAN)
+    this.inRecord = st[0]
+    this.units = st[1]
+    return this
+  }
+
+  /** BEL and, when given, a note. Bare, it marks the element that follows dead. */
+  bel(text?: BuilderValue): this {
+    if (text !== undefined) {
+      const bytes = toBytes(text)
+      if (bytes.length === 0) throw new C0Error(EMPTY_NOTE)
+      this.io.push(BEL)
+      writeValue(this.io, bytes)
+    } else {
+      this.io.push(BEL)
     }
     return this
   }
 
-  /** A heading key whose value is a nested level (e.g. the blob table). */
-  headingLevel(key: string, fn: () => void): this {
-    this.endRecord()
-    this.io.push(SOH)
-    writeName(this.io, key)
-    this.io.push(US)
-    this.openLevel(fn)
+  /** ENQ and a reference: a group name, or a path of two or three names. */
+  enq(...path: string[]): this {
+    if (path.length === 0 || path.length > 3) throw new C0Error('a reference has one to three segments')
+    this.io.push(ENQ)
+    if (path.length === 1) {
+      writeName(this.io, path[0])
+      return this
+    }
+    this.io.push(STX)
+    path.forEach((seg, i) => {
+      if (i > 0) this.io.push(US)
+      const bytes = toBytes(seg)
+      if (!isName(bytes) || bytes.length === 0) throw new C0Error('reference segment is not a name')
+      this.io.write(bytes)
+    })
+    this.io.push(ETX)
     return this
   }
 
+  /**
+   * SYN: start a document. Bare, heading pairs follow as `soh(key).us(value)`;
+   * given pairs, they are written in the order given.
+   */
+  syn(pairs?: Pairs): this {
+    this.endRecord()
+    this.io.push(SYN)
+    if (pairs !== undefined) for (const [k, v] of pairEntries(pairs)) this.soh(k).us(v)
+    return this
+  }
+
+  /** EOT: end a document. */
   eot(): this {
     this.endRecord()
     this.io.push(EOT)
     return this
   }
 
+  /** ETB and, when given, a commit payload. */
   etb(payload?: BuilderValue): this {
     this.endRecord()
     this.io.push(ETB)
@@ -96,20 +194,27 @@ export class Builder {
     return this
   }
 
+  // ---- documents -------------------------------------------------------
+
+  /** A heading key whose value is a nested level (e.g. the blob table). */
+  headingLevel(key: string, fn: () => void): this {
+    this.endRecord()
+    this.soh(key).us()
+    this.openLevel(fn)
+    return this
+  }
+
   // ---- structure -------------------------------------------------------
 
   file(name: string, fn?: () => void): this {
-    this.endRecord()
-    this.io.push(FS)
-    writeName(this.io, name)
+    this.fs(name)
     if (fn) fn()
     return this
   }
 
   group(name: string, headers?: string[] | null, fn?: () => void, depth: number = 1): this {
-    this.endRecord()
-    for (let i = 0; i < depth; i++) this.io.push(GS)
-    writeName(this.io, name)
+    for (let i = 1; i < depth; i++) this.gs()
+    this.gs(name)
     if (headers) this.header(headers)
     if (fn) fn()
     return this
@@ -120,13 +225,14 @@ export class Builder {
   header(...names: string[]): this
   header(...args: (string | string[])[]): this {
     const names = args.length === 1 && Array.isArray(args[0]) ? args[0] : (args as string[])
+    for (const n of names) writeName(new ByteWriter(), n)
     this.endRecord()
-    this.io.push(SOH)
-    this.io.push(RS)
+    this.soh().rs()
     names.forEach((n, i) => {
-      if (i > 0) this.io.push(US)
-      writeName(this.io, n)
+      if (i === 0) this.firstValue(n)
+      else this.us(n)
     })
+    this.endRecord()
     return this
   }
 
@@ -139,7 +245,7 @@ export class Builder {
 
   /** A positional record; with no fields, begins a record left open for `field` / `level` / `list` / `key`. */
   record(...fields: BuilderValue[]): this {
-    this.startRecord()
+    this.rs()
     for (const f of fields) this.field(f)
     return this
   }
@@ -160,28 +266,30 @@ export class Builder {
 
   /** Append a unit to the open record (opens one if none is open). */
   field(value: BuilderValue): this {
-    this.nextUnit()
-    writeValue(this.io, value)
-    return this
+    if (!this.inRecord) return this.rs(value)
+    if (this.units === 0) {
+      this.firstValue(value)
+      return this
+    }
+    return this.us(value)
   }
 
   /** A keyed record: a map, entries in the order given. */
   map(pairs: Pairs): this {
-    this.startRecord()
-    for (const [k, v] of pairEntries(pairs)) this.key(k, v)
+    this.rs()
+    for (const [k, v] of pairEntries(pairs)) this.soh(k).us(v)
     return this
   }
 
   /** One keyed unit on the open record (order is the caller's); a function value writes a nested level. */
   key(name: string, value: BuilderValue | (() => void)): this {
-    if (!this.inRecord) this.startRecord()
-    this.io.push(SOH)
-    writeName(this.io, name)
-    this.io.push(US)
-    this.units++
-    if (typeof value === 'function') this.openLevel(value)
-    else writeValue(this.io, value)
-    return this
+    if (!this.inRecord) this.rs()
+    if (typeof value === 'function') {
+      this.soh(name).us()
+      this.openLevel(value)
+      return this
+    }
+    return this.soh(name).us(value)
   }
 
   // ---- values that are not plain -------------------------------------
@@ -196,78 +304,59 @@ export class Builder {
   /** A flat list as the next unit: a level holding one record. */
   list(items: BuilderValue[]): this {
     this.nextUnit()
-    this.io.push(DLE)
+    this.dle()
     if (items.length > 0) {
-      this.io.push(RS)
-      items.forEach((it, i) => {
-        if (i > 0) this.io.push(US)
-        writeValue(this.io, it)
-      })
+      this.rs()
+      for (const it of items) this.field(it)
     }
-    this.io.push(CAN)
-    return this
+    return this.can()
   }
 
   /** A reference as the next unit: a group name, or a path of two or three names. */
   ref(...path: string[]): this {
     if (path.length === 0 || path.length > 3) throw new C0Error('a reference has one to three segments')
     this.nextUnit()
-    this.io.push(ENQ)
-    if (path.length === 1) {
-      writeName(this.io, path[0])
-      return this
-    }
-    this.io.push(STX)
-    path.forEach((seg, i) => {
-      if (i > 0) this.io.push(US)
-      const bytes = toBytes(seg)
-      if (!isName(bytes) || bytes.length === 0) throw new C0Error('reference segment is not a name')
-      this.io.write(bytes)
-    })
-    this.io.push(ETX)
-    return this
+    return this.enq(...path)
   }
 
   // ---- comments ----------------------------------------------------------
 
-  /** A note at the current position (record level, or as an empty unit). */
+  /**
+   * A note at the current position. Content is required: a bare BEL is a
+   * dead marker, written with `bel()`.
+   */
   note(text: BuilderValue): this {
-    this.io.push(BEL)
-    const bytes = toBytes(text)
-    if (isPlain(bytes) && bytes.length > 0) this.io.write(bytes)
-    else writeValue(this.io, bytes)
-    return this
+    if (toBytes(text).length === 0) throw new C0Error(EMPTY_NOTE)
+    return this.bel(text)
   }
 
   // ---- internals ---------------------------------------------------------
-
-  private startRecord(): void {
-    this.io.push(RS)
-    this.inRecord = true
-    this.units = 0
-  }
 
   private endRecord(): void {
     this.inRecord = false
     this.units = 0
   }
 
+  /**
+   * Position for the next unit of the open record (opening one if needed):
+   * US between units, nothing before the first.
+   */
   private nextUnit(): void {
-    if (!this.inRecord) this.startRecord()
-    if (this.units > 0) this.io.push(US)
+    if (!this.inRecord) this.rs()
+    else if (this.units > 0) this.io.push(US)
     this.units++
   }
 
+  /** The first value of a record, straight after RS. */
+  private firstValue(value: BuilderValue): void {
+    writeValue(this.io, value)
+    this.units = 1
+  }
+
   private openLevel(fn: () => void): void {
-    this.stack.push([this.inRecord, this.units])
-    this.inRecord = false
-    this.units = 0
-    this.io.push(DLE)
+    this.dle()
     fn()
-    this.io.push(CAN)
-    const st = this.stack.pop()!
-    this.inRecord = st[0]
-    this.units = st[1]
+    this.can()
   }
 }
 

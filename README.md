@@ -80,6 +80,24 @@ when it can be and as text (`␂…␃`) when it must be: edge whitespace, a tab
 line break, or any control byte. Names (file and group labels, keys, header
 names) must be identifiers.
 
+Underneath, the builder has one method per code: `fs`, `gs`, `rs`, `us`,
+`soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
+its code and, when given, what follows it, so a chain reads like the
+bytes, and anything the grammar allows can be written:
+
+```ts
+b.rs('Alice').us('1502.30')                                  // ␞Alice␟1502.30
+b.rs().soh('host').us('localhost').soh('port').us('5432')    // ␞␁host␟localhost␁port␟5432
+b.gs('users').soh().rs('name').us('amount')                  // header row
+b.rs('cfg').us().dle().rs().soh('b').us('2').can()           // ␞cfg␟␐␞␁b␟2␘
+b.bel().gs('old')                                            // a dead group
+b.gs().gs('sub').rs().enq('users').us().enq('users', '1')    // ␝␝sub␞␅users␟␅␂users␟1␃
+```
+
+The composed methods above are built on these and cannot write ill-formed
+output; with the primitives, well-formedness is yours. The two layers
+share state and mix freely: `b.rs('a').field('b')` writes `␞a␟b`.
+
 ### Keyed records, levels and lists
 
 ```ts

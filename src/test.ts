@@ -159,6 +159,74 @@ describe('Builder', () => {
     })
     assert.equal(canonical(bytes), true)
   })
+
+  it('refuses an empty note', () => {
+    assert.throws(() => build(b => b.record('a').note('')), C0Error)
+    assert.throws(() => build(b => b.record('a').bel('')), C0Error)
+    assert.throws(() => build(b => b.record('a').bel(new Uint8Array(0))), C0Error)
+  })
+
+  it('spells primitives as the bytes read', () => {
+    assert.deepEqual(build(b => b.fs('inv').gs('users').soh().rs('name').us('amount')), g('␜inv␝users␁␞name␟amount'))
+    assert.deepEqual(build(b => b.rs('Alice').us('1502.30')), g('␞Alice␟1502.30'))
+    assert.deepEqual(build(b => b.rs().soh('host').us('localhost').soh('port').us('5432')), g('␞␁host␟localhost␁port␟5432'))
+    assert.deepEqual(build(b => b.rs('cfg').us().dle().rs().soh('b').us('2').can()), g('␞cfg␟␐␞␁b␟2␘'))
+    assert.deepEqual(build(b => b.bel('checked').rs('x')), g('␇checked␞x'))
+    assert.deepEqual(build(b => b.bel().gs('old').rs('1').gs('new').rs('2')), g('␇␝old␞1␝new␞2'))
+    assert.deepEqual(build(b => b.gs().gs('sub').rs().enq('users').us().enq('users', '1')), g('␝␝sub␞␅users␟␅␂users␟1␃'))
+    assert.deepEqual(build(b => b.syn().soh('version').us('1').rs('a').eot()), g('␖␁version␟1␞a␄'))
+    assert.deepEqual(build(b => b.rs(' a ').us(' b ').bel(' n ').etb('c1')), buf(RS, STX, ' a ', ETX, US, STX, ' b ', ETX, BEL, STX, ' n ', ETX, ETB, 'c1'))
+  })
+
+  it('validates names in the primitives', () => {
+    assert.throws(() => build(b => b.fs(' f')), C0Error)
+    assert.throws(() => build(b => b.gs('a\tb')), C0Error)
+    assert.throws(() => build(b => b.soh('k ')), C0Error)
+    assert.throws(() => build(b => b.enq(' x')), C0Error)
+    assert.throws(() => build(b => b.enq('a', 'b', 'c', 'd')), C0Error)
+    assert.throws(() => build(b => b.etb(' p')), C0Error)
+  })
+
+  it('mixes primitives with composed methods', () => {
+    const bytes = build(b => {
+      b.rs('a')
+      b.field('b')
+      b.record()
+      b.us('c')
+      b.gs('g')
+      b.key('k', 'v')
+      b.group('h', ['h'])
+      b.field('x')
+    })
+    assert.deepEqual(bytes, g('␞a␟b␞␟c␝g␞␁k␟v␝h␁␞h␞x'))
+    assert.throws(() => build(b => b.can()), C0Error)
+    assert.throws(() => build(b => b.dle().can().can()), C0Error)
+  })
+
+  it('writes the same bytes through either layer', () => {
+    const hi = build(b => {
+      b.syn({ shape: 'tabular' })
+      b.group('users', ['name', 'amount'], () => {
+        b.record('Alice', '1502.30')
+        b.record('Bob', '3 40')
+      })
+      b.group('cfg')
+      b.map({ host: 'localhost', port: '5432' })
+      b.record('r').level(() => { b.record('n') }).list(['i', 'j']).ref('users', '1')
+      b.record().key('k', () => { b.record('v') })
+      b.eot()
+    })
+    const lo = build(b => {
+      b.syn().soh('shape').us('tabular')
+      b.gs('users').soh().rs('name').us('amount').rs('Alice').us('1502.30').rs('Bob').us('3 40')
+      b.gs('cfg').rs().soh('host').us('localhost').soh('port').us('5432')
+      b.rs('r').us().dle().rs('n').can().us().dle().rs('i').us('j').can().us().enq('users', '1')
+      b.rs().soh('k').us().dle().rs('v').can()
+      b.eot()
+    })
+    assert.deepEqual(lo, hi)
+    assert.equal(canonical(new Document(lo).body.raw), true)
+  })
 })
 
 // ============================================================
