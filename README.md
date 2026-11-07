@@ -38,19 +38,18 @@ git submodule update --init
 
 ## Install
 
-Not yet published to npm. From a checkout:
-
 ```sh
-npm install
-npm run build    # compiles src/ to dist/
+npm install c0data
 ```
+
+From a checkout: `npm install` then `npm run build` (compiles src/ to dist/).
 
 Then import from `dist/index.js`, or `npm link` it into a project.
 
 ## Usage
 
 ```ts
-import { build, Document, canonical } from 'c0'
+import { build, Document, canonical } from 'c0data'
 
 // Build a document: SYN heading, a file, a group with a header row, EOT
 const buf = build(b => {
@@ -126,7 +125,7 @@ alice.ref(3).segments        // ["tags", "001"]
 ### Documents and containers
 
 ```ts
-import { Container, validate } from 'c0'
+import { Container, validate } from 'c0data'
 
 const cont = new Container(bytes)   // several ␖…␄ documents and an optional ␙ tail
 cont.documents[0].heading.shape     // "tabular" | "stream" | "diff" | undefined
@@ -138,7 +137,7 @@ validate(bytes)                     // throws C0SyntaxError on malformed input
 ### Stream logs (ETB commits)
 
 ```ts
-import { openLog, readLog } from 'c0'
+import { openLog, readLog } from 'c0data'
 
 const log = await openLog('claims.c0')    // repairs a torn tail first
 log.start()                               // ␖␁shape␟stream␗ on a new log
@@ -162,7 +161,7 @@ r.eachRecord(rec => { /* ... */ })
 ### Pretty form and converters
 
 ```ts
-import { format, parse, fromCSV, toCSV, toJSON, fromJSON, buildDiff, applyDiff } from 'c0'
+import { format, parse, fromCSV, toCSV, toJSON, fromJSON, buildDiff, applyDiff } from 'c0data'
 
 format(buf)                // Unicode Control Pictures, one element per line
 format(buf, { mode: 'aligned' })

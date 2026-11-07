@@ -1,7 +1,11 @@
 {
-  "name": "c0",
-  "version": "0.4.0",
-  "description": "C0DATA \u2014 structured data using ASCII C0 control codes (1.0 redesign)",
+  "name": "c0data",
+  "version": "0.4.1",
+  "description": "C0DATA — structured data using ASCII C0 control codes (1.0 redesign)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/c0data/c0-js"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,13 +16,16 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/*.test.*",
+    "!dist/test.*"
   ],
   "scripts": {
     "build": "tsc",
     "test": "node --test 'dist/*.test.js' dist/test.js",
     "pretest": "tsc",
-    "docs": "typedoc"
+    "docs": "typedoc",
+    "prepublishOnly": "tsc"
   },
   "keywords": [
     "c0",

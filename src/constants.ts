@@ -1,6 +1,6 @@
 /** C0DATA control code byte constants (DESIGN.md "Assigned Control Codes"). */
 
-export const VERSION = '0.4.0'
+export const VERSION = '0.4.1'
 
 export const SOH = 0x01 // Heading: a key for the value after it, or SOH RS a header row
 export const STX = 0x02 // Start of text (literal value)
