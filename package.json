@@ -4,7 +4,7 @@
   "description": "C0DATA — structured data using ASCII C0 control codes (1.0 redesign)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/c0data/c0-js"
+    "url": "git+https://github.com/c0data/c0-js.git"
   },
   "type": "module",
   "main": "./dist/index.js",
